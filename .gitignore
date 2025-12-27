@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Dataset outputs / downloads
+data/
+*.jsonl
+*.parquet
+*.arrow
+
+# Logs / misc
+*.log
+.DS_Store

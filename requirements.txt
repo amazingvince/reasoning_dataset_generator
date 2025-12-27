@@ -1,0 +1,5 @@
+# Minimal requirements for dataset generation (no training deps).
+datasets>=2.20.0
+python-chess>=1.10.0
+pyyaml>=6.0
+tqdm>=4.66.0

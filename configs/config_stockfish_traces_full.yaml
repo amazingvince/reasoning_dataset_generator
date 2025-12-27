@@ -1,0 +1,488 @@
+# Streaming JSONL Stockfish Trace Dataset (fully documented config)
+# ================================================================
+#
+# This config is consumed by `make_dataset.py` to generate a streaming JSONL
+# dataset with exactly these columns:
+#   - fen: string
+#   - valid_moves: list[str] of legal UCI moves
+#   - reasoning_trace: free-form text (no token cutoff in JSONL mode)
+#   - chosen_move: Stockfish best move (UCI)
+#
+# Entry point:
+#   python make_dataset.py \
+#     --config configs/config_stockfish_traces_full.yaml \
+#     --output-jsonl ./data/chess_traces.jsonl
+#
+# Notes:
+# - Positions are streamed from HuggingFace datasets (Lichess games + puzzles).
+# - In JSONL mode, `reasoning_trace.max_trace_tokens` is forced to null by the
+#   exporter to avoid truncating traces.
+
+# -----------------------------------------------------------------------------
+# Data: where positions come from + how we sample them
+# -----------------------------------------------------------------------------
+data:
+  # HuggingFace datasets (streamed)
+  games_dataset: "Lichess/standard-chess-games"
+  puzzles_dataset: "Lichess/chess-puzzles"
+
+  # Total number of positions to generate (games + puzzles)
+  target_size: 200000
+
+  # Mix ratio:
+  # - 0.7 => 70% game positions, 30% puzzle positions
+  games_ratio: 0.7
+
+  # -----------------------------
+  # Game position sampling
+  # -----------------------------
+  # Only sample games where both players have at least this ELO.
+  min_elo: 1200
+
+  # For each eligible game, sample positions with this probability.
+  sample_rate: 0.3
+
+  # Skip early openings (avoid "startpos" spam).
+  skip_first_moves: 4
+
+  # Skip very late endgames (often tablebase-like noise).
+  skip_last_moves: 2
+
+  # -----------------------------
+  # Puzzle filtering
+  # -----------------------------
+  min_puzzle_rating: 1000
+  max_puzzle_rating: 2500
+
+# Optional ELO-based sampling weights for game positions.
+# Uses the average of (WhiteElo, BlackElo). Higher ratings get higher keep-prob.
+elo_weights:
+  1200: 0.05
+  1400: 0.10
+  1600: 0.15
+  1800: 0.25
+  2000: 0.30
+  2200: 0.20
+  2400: 0.10
+
+# -----------------------------------------------------------------------------
+# Stockfish: how we evaluate each position
+# -----------------------------------------------------------------------------
+stockfish:
+  # Path to Stockfish binary (null => auto-detect via PATH/common locations).
+  path: null
+
+  # Search depth (higher = stronger + slower).
+  depth: 20
+
+  # Parallelism:
+  # - workers: number of concurrent Stockfish engine processes
+  # - threads_per_worker: threads inside each Stockfish process
+  #   (total CPU threads ~= workers * threads_per_worker)
+  workers: 24
+  threads_per_worker: 1
+
+  # Hash size per worker (MB). Larger can help at higher depths.
+  hash_mb: 512
+
+  # How many moves to evaluate per position:
+  # - null => evaluate ALL legal moves (slow in high-mobility positions)
+  # - N => evaluate only top-N moves (recommended for scaling)
+  multipv: 8
+
+  # Optional extra passes for richer traces (trap/resource detection).
+  # These run *in addition* to the main `depth` evaluation.
+  # - shallow_depth: quick scan over top-K moves
+  # - confirm_depth: deeper re-check over top-K moves (0 to disable confirm)
+  shallow_depth: 6
+  confirm_depth: 20
+
+# -----------------------------------------------------------------------------
+# HuggingFace Hub uploads (optional, incremental)
+# -----------------------------------------------------------------------------
+# If enabled, the generator will periodically upload sealed JSONL shards to a
+# Hub *dataset* repo so it can be consumed immediately via `load_dataset()`.
+#
+# Auth:
+#   export HF_TOKEN=...
+#   # or: export HUGGINGFACE_HUB_TOKEN=...
+#
+# Loading from the Hub (no further processing):
+#   from datasets import load_dataset
+#   ds = load_dataset("USER/REPO", split="train")
+#
+hub:
+  # HuggingFace dataset repo id, e.g. "vince/chess-traces".
+  # Set to null to disable uploads.
+  repo_id: amazingvince/chess-traces
+
+  # Create the repo as private (you can flip visibility later on the Hub).
+  private: true
+
+  # Upload cadence (15 minutes default).
+  upload_interval_seconds: 900
+
+  # Safety valve: rotate shard files once they hit this many lines (0 = disabled).
+  shard_max_lines: 0
+
+  # Upload retry behavior.
+  max_retries: 10
+  retry_backoff_seconds: 30
+
+  # Split name inferred by `datasets` from filenames (train/validation/test).
+  split: "train"
+
+# -----------------------------------------------------------------------------
+# Move-prob distillation: used to shape candidate selection and difficulty cues
+# -----------------------------------------------------------------------------
+# We convert centipawn scores into a probability distribution to:
+# - pick diverse candidates (softmax sampling)
+# - detect "only move" vs "many options" situations
+distillation:
+  # Probability floor per legal move (encourages exploration)
+  min_probability: 0.001
+
+  # Softmax temperature when mapping evals => probabilities
+  # (higher = flatter distribution)
+  stockfish_temperature: 100.0
+
+# -----------------------------------------------------------------------------
+# Reasoning trace generator
+# -----------------------------------------------------------------------------
+reasoning_trace:
+  # RNG seed for trace variety (useful for reproducibility)
+  seed: 42
+
+  # Trace length budget. NOTE: JSONL mode forces this to null (no cutoff).
+  max_trace_tokens: null
+
+  # Move notation used inside the trace text:
+  # - uci: e2e4, g1f3, ...
+  # - san: e4, Nf3, ...
+  move_notation: "uci"
+
+  # -----------------------------
+  # Candidate move selection
+  # -----------------------------
+  # Explore between min_candidates..max_candidates moves (randomized per example).
+  min_candidates: 3
+  max_candidates: 8
+
+  # Candidate order in the trace:
+  # - shuffled: analyze in randomized order (recommended; reduces "first move is best" shortcut)
+  # - fixed: keep Stockfish order (strongest first)
+  candidate_order: "shuffled"
+
+  # Pick candidates from the top-K pool for variety.
+  candidate_pool_size: 12
+
+  # How to sample from the pool:
+  # - top: take the top-N directly
+  # - uniform: sample uniformly from the pool
+  # - softmax: sample proportional to win probability
+  candidate_pool_sampling: "softmax"
+
+  # Only used for candidate_pool_sampling: softmax (lower = sharper preference)
+  candidate_pool_temperature: 0.25
+
+  # -----------------------------
+  # Language features ("square talk")
+  # -----------------------------
+  # When moves are quiet (non-check/capture), optionally mention:
+  # - concrete targets (e.g. "targets the queen on d8")
+  # - rook file activity (open/half-open files)
+  # - knight posts/outposts (e.g. "posts a knight on f5")
+  # - key-square pressure (e.g. "challenges the d5 square")
+  feature_include_target_piece: true
+  feature_target_min_value: 3
+  feature_include_rook_files: true
+  feature_include_knight_posts: true
+  feature_include_square_pressure: true
+
+  # -----------------------------
+  # Optional external enrichments
+  # -----------------------------
+  include_opening: true
+  opening_paths:
+    - "./data/openings/a.tsv"
+    - "./data/openings/b.tsv"
+    - "./data/openings/c.tsv"
+    - "./data/openings/d.tsv"
+    - "./data/openings/e.tsv"
+
+  include_tablebase: true
+  tablebase_paths:
+    - "./data/syzygy"
+
+  # If true, apply small language guardrails (e.g. don't say "winning" in tablebase draws).
+  guardrail_enabled: true
+
+  # -----------------------------
+  # High-level trace structure toggles
+  # -----------------------------
+  include_orientation: true
+  orientation_starter_prob: 0.25
+
+  # If the position matches a known opening, sometimes add a short plan hint.
+  include_opening_plan_hints: true
+  opening_plan_prob: 0.25
+
+  # Sometimes add an explicit "FEN decode" block (turn/castling/EP/etc).
+  include_fen_walkthrough: true
+  fen_walkthrough_prob: 0.15
+  # Options: auto, bullets, sentences
+  fen_walkthrough_format: "auto"
+  fen_walkthrough_max_items: 4
+  fen_walkthrough_include_turn: true
+  fen_walkthrough_include_check: true
+  fen_walkthrough_include_castling: true
+  fen_walkthrough_include_en_passant: true
+  fen_walkthrough_include_kings: true
+  fen_walkthrough_include_queens: true
+  fen_walkthrough_include_material: false
+  fen_walkthrough_include_piece_count: false
+
+  include_assessment: true
+  # If best-vs-next win-prob is within this margin, use "unclear/balanced" language.
+  unclear_win_margin: 0.04
+
+  include_threat_scan: true
+  # Threat scan is useful but can get repetitive, so gate it by probability.
+  threat_scan_prob: 0.45
+  threat_max_checks: 2
+  threat_max_hanging: 2
+  threat_scan_include_empty: false
+
+  include_plan: true
+  plan_prob: 0.30
+
+  include_opponent_perspective: true
+  opponent_perspective_prob: 0.25
+
+  include_reconsideration: true
+  reconsideration_prob: 0.20
+
+  include_dead_end: true
+  dead_end_prob: 0.20
+
+  include_comparison: true
+  comparison_prob: 0.30
+
+  # Optional generic “hint” line to diversify traces.
+  include_context_hints: true
+  context_hint_prob: 0.18
+  puzzle_context_hint_mult: 1.5
+  game_context_hint_mult: 0.7
+
+  # Optional “decision difficulty” line derived from the Stockfish move distribution.
+  include_decision_profile: true
+  decision_profile_prob: 0.25
+  puzzle_decision_profile_mult: 1.2
+  game_decision_profile_mult: 0.8
+
+  # Decision-profile thresholds (mostly used internally; tweak for tone).
+  close_move_cp_loss: 30
+  only_move_cp_loss: 150
+  only_move_best_prob: 0.55
+  many_options_entropy: 0.82
+  many_options_best_prob: 0.22
+  many_options_second_cp_loss: 20
+
+  # -----------------------------
+  # PV and conclusion formatting
+  # -----------------------------
+  # Include principal variation text for the best move (if present in analysis).
+  include_pv: true
+  # PVs are informative but long; include them only sometimes.
+  pv_prob: 0.55
+  # In forced/only-move situations, keep PVs more often.
+  pv_prob_forced_min: 0.85
+  max_pv_length: 8
+
+  # To keep runtime/storage reasonable, only store PVs for the top-K moves.
+  # (Used during dataset generation; affects whether candidate PV snippets can appear.)
+  pv_store_top_k: 12
+
+  # Per-candidate short PV snippets (adds variety, costs tokens).
+  include_candidate_pv: true
+  candidate_pv_prob: 0.30
+  candidate_pv_max_len: 4
+  # Limit how many candidates get PV snippets in a single trace.
+  candidate_pv_max_per_trace: 1
+  # Small bias to show the PV for the best move slightly more often.
+  candidate_pv_best_mult: 1.2
+
+  # Sometimes phrase a candidate paragraph as a question ("What about e2e4?").
+  candidate_question_prob: 0.35
+
+  # PV summary ("key moments") derived from the best PV: forcingness score,
+  # first forcing point, and (optionally) a motif spotted in the PV.
+  include_pv_key_moments: true
+  pv_key_moments_prob: 0.25
+  pv_key_moments_max_plies: 8
+  pv_key_moments_include_forcingness: true
+  pv_key_moments_include_motif: true
+
+  # Optional PV "English narration" using heuristic move features.
+  include_pv_explainer: true
+  pv_explainer_prob: 0.18
+  pv_explainer_max_plies: 6
+  pv_explainer_max_features_per_move: 2
+  # Options: bullets, sentences
+  pv_explainer_format: "bullets"
+
+  # Add a short confidence-calibration clause to the final conclusion.
+  include_confidence_in_conclusion: true
+
+  # -----------------------------
+  # Static evaluation “notes” (positional talk)
+  # -----------------------------
+  include_static_eval_notes: true
+  static_eval_prob: 0.25
+  max_static_eval_notes: 2
+  static_eval_include_material: true
+  static_eval_include_pawn_structure: true
+  static_eval_include_king_safety: true
+  static_eval_include_development: true
+  static_eval_include_mobility: true
+  mobility_note_threshold: 8
+
+  include_positional_cues: true
+  max_positional_cues: 4
+
+  # Optional endgame-technique snippet (only triggers in endgames).
+  include_endgame_technique: true
+  endgame_technique_prob: 0.30
+  endgame_tablebase_hint_prob: 0.50
+
+  # PV pruning/summarization:
+  # - pv_prune_quiet: drop quiet/non-forcing moves after a short prefix
+  # - pv_quiet_summary: replace long quiet tails with a short summary sentence
+  pv_prune_quiet: true
+  pv_prune_quiet_plies: 2
+  pv_prune_min_moves: 2
+  pv_quiet_summary: true
+
+  # -----------------------------
+  # Motif detection (tactical/positional labels)
+  # -----------------------------
+  # Motifs are lightweight, heuristic labels derived from the position + move.
+  # Current coverage includes classic tactics (fork/pin/skewer/deflection/x-ray),
+  # plus: interference (cutting a line of defense), en passant tactics,
+  # underpromotions, checkmate patterns (e.g. smothered/back-rank), and "desperado"
+  # captures (a hanging piece cashing out before it gets taken).
+  include_motifs: true
+  max_motifs_per_candidate: 1
+  # Motifs can get spammy if printed for every candidate; gate + cap them.
+  candidate_motif_prob: 0.50
+  candidate_motif_max_per_trace: 2
+  candidate_motif_best_mult: 1.1
+
+  # Trap lines are already rare; cap how many can appear per trace.
+  candidate_trap_prob: 1.0
+  candidate_trap_max_per_trace: 1
+
+  # A “quiet move” motif is higher-variance; disable if it gets spammy.
+  include_quiet_move_motif: true
+
+  # Extra motif families (default true inside the generator)
+  include_coordination: true
+  include_tempo: true
+  include_prophylactic: true
+  include_aesthetic: true
+
+  # Perpetual-check lookahead depth (plies)
+  perpetual_max_plies: 6
+
+  # -----------------------------
+  # Trap detection (shallow-vs-deep disagreements)
+  # -----------------------------
+  include_trap_detection: true
+  trap_probe_top_k: 12
+  trap_min_cp_swing: 80
+  trap_min_win_prob_swing: 0.12
+  trap_shallow_good_cp: 30
+  trap_shallow_bad_cp: 120
+  trap_shallow_good_win_prob: 0.06
+  trap_shallow_bad_win_prob: 0.18
+  trap_confirm_cp_tolerance: 30
+  trap_confirm_win_prob_tolerance: 0.05
+  trap_refutation_max_len: 4
+
+  # -----------------------------
+  # "What to avoid" warnings
+  # -----------------------------
+  # Flags a likely-but-bad move (high probability under the distilled policy,
+  # but large centipawn loss). When PV is available, the trace also explains
+  # what goes wrong (e.g., drops a queen / gets mated / tactical refutation),
+  # and may include a short refutation line.
+  include_avoid_blunders: true
+  avoid_blunder_prob: 0.20
+  avoid_min_cp_loss: 120
+  avoid_min_move_prob: 0.05
+
+  # -----------------------------
+  # Dialogue style tuning
+  # -----------------------------
+  # The dialogue style formats the trace as short Q/A turns inside a single string.
+  dialogue_speaker_pairs:
+    - ["Coach", "Student"]
+    - ["Analyst", "Skeptic"]
+    - ["Tutor", "Learner"]
+  dialogue_max_candidates: 3
+  dialogue_threat_scan_prob: 0.35
+  dialogue_candidate_pv_prob: 0.35
+  dialogue_motif_prob: 0.35
+  dialogue_trap_prob: 0.40
+
+  # -----------------------------
+  # Style selection (variety)
+  # -----------------------------
+  # Force a specific style by setting `style` to one of:
+  # thorough, concise, tactical, quick, problem_focused, intuition, comparison_focused
+  style: null
+
+  # Otherwise, pick a style per-example using weights:
+  style_weights:
+    thorough: 0.40
+    concise: 0.15
+    tactical: 0.10
+    quick: 0.10
+    problem_focused: 0.10
+    intuition: 0.08
+    comparison_focused: 0.07
+    # Coherent Q/A formatting (single string, not a separate message column).
+    dialogue: 0.05
+
+  # Extra style biases:
+  # - puzzle_style_bias_enabled: uses Lichess puzzle themes/rating (when present)
+  #   to slightly reweight styles.
+  # - dynamic_style_bias: uses the Stockfish move distribution to sometimes
+  #   pick a better-fitting style (e.g. forcing mate => tactical).
+  puzzle_style_bias_enabled: true
+  dynamic_style_bias: true
+  dynamic_style_bias_prob: 0.35
+
+  # Source-aware overrides merged on top of the global config.
+  source_overrides:
+    puzzle:
+      # Bias puzzles toward tactical/problem-focused language
+      style_weights:
+        tactical: 0.32
+        problem_focused: 0.22
+        quick: 0.14
+        intuition: 0.10
+        comparison_focused: 0.08
+        thorough: 0.08
+        concise: 0.06
+        dialogue: 0.06
+    game:
+      style_weights:
+        thorough: 0.42
+        concise: 0.18
+        comparison_focused: 0.12
+        intuition: 0.10
+        quick: 0.08
+        tactical: 0.06
+        problem_focused: 0.04
+        dialogue: 0.03
