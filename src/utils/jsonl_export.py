@@ -598,14 +598,18 @@ def write_jsonl_with_traces(
                 if key in result:
                     example[key] = result.get(key)
 
-            analysis = position_with_eval_to_analysis(
-                example,
-                min_probability=min_probability,
-                stockfish_temperature=stockfish_temperature,
-            )
-            digest = hashlib.sha256(f"{seed}|{example['fen']}".encode("utf-8")).digest()
-            per_example_rng = random.Random(int.from_bytes(digest[:8], byteorder="big", signed=False))
-            reasoning_trace = trace_generator.generate(example, analysis, rng=per_example_rng)
+            try:
+                analysis = position_with_eval_to_analysis(
+                    example,
+                    min_probability=min_probability,
+                    stockfish_temperature=stockfish_temperature,
+                )
+                digest = hashlib.sha256(f"{seed}|{example['fen']}".encode("utf-8")).digest()
+                per_example_rng = random.Random(int.from_bytes(digest[:8], byteorder="big", signed=False))
+                reasoning_trace = trace_generator.generate(example, analysis, rng=per_example_rng)
+            except Exception as exc:
+                logger.warning("Analysis/trace pipeline failed (fen=%s): %s", example.get("fen"), exc)
+                reasoning_trace = f"Play {chosen_move}."
 
             row = {
                 "fen": example["fen"],

@@ -5159,10 +5159,10 @@ class ReasoningTraceGenerator:
                     continue
                 if defender_piece.piece_type not in (chess.ROOK, chess.BISHOP, chess.QUEEN):
                     continue
-                between = chess.BB_BETWEEN[defender_sq][target_sq]
-                if not between:
+                between_squares = self._squares_between(defender_sq, target_sq)
+                if not between_squares:
                     continue
-                if not (between & chess.BB_SQUARES[blocker_sq]):
+                if blocker_sq not in between_squares:
                     continue
 
                 target_name = PIECE_NAMES.get(target_piece.piece_type, "piece")
@@ -5173,6 +5173,45 @@ class ReasoningTraceGenerator:
                 return f"interference—cuts defense of {target_name} on {target_square}"
 
         return None
+
+    @staticmethod
+    def _squares_between(a: chess.Square, b: chess.Square) -> List[chess.Square]:
+        """
+        Return squares strictly between `a` and `b` if aligned (rank/file/diagonal).
+
+        Avoids relying on `python-chess` bitboard constants that may vary across
+        versions (e.g. `chess.BB_BETWEEN`).
+        """
+        file_a = chess.square_file(a)
+        rank_a = chess.square_rank(a)
+        file_b = chess.square_file(b)
+        rank_b = chess.square_rank(b)
+        df = file_b - file_a
+        dr = rank_b - rank_a
+
+        step_file = 0
+        step_rank = 0
+        if df == 0 and dr != 0:
+            step_rank = 1 if dr > 0 else -1
+        elif dr == 0 and df != 0:
+            step_file = 1 if df > 0 else -1
+        elif abs(df) == abs(dr) and df != 0:
+            step_file = 1 if df > 0 else -1
+            step_rank = 1 if dr > 0 else -1
+        else:
+            return []
+
+        squares: List[chess.Square] = []
+        cur_file = file_a + step_file
+        cur_rank = rank_a + step_rank
+        while 0 <= cur_file <= 7 and 0 <= cur_rank <= 7:
+            sq = chess.square(cur_file, cur_rank)
+            if sq == b:
+                break
+            squares.append(sq)
+            cur_file += step_file
+            cur_rank += step_rank
+        return squares
 
     def _detect_zwischenzug(
         self,
