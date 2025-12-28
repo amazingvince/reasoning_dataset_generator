@@ -20,15 +20,6 @@ data/
 *.parquet
 *.arrow
 
-# Training / experiment outputs
-wandb/
-runs/
-tensorboard/
-*.pt
-*.ckpt
-*.safetensors
-
 # Logs / misc
 *.log
 .DS_Store
-

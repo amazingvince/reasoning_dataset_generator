@@ -1,0 +1,20 @@
+# Chess GRPO Training Requirements - Unsloth + H100 Optimized
+
+# Unsloth (pins compatible versions; pick the extra that matches your CUDA/PyTorch)
+unsloth
+
+# vLLM - Fast inference for GRPO generations
+vllm
+
+# TRL - GRPO trainer
+trl
+
+# Datasets / config
+datasets
+pyyaml
+
+# Chess + logging
+python-chess
+tensorboard
+wandb
+

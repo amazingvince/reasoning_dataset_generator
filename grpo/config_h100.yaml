@@ -1,0 +1,156 @@
+# Chess GRPO Training Configuration - Optimized for Single H100 80GB
+# ===================================================================
+
+# Model Configuration
+model:
+  name_or_path: "your-chess-model-4b"  # Replace with your 4B model path
+  max_seq_length: 4096  # Prompt + completion total
+
+# Unsloth Configuration
+unsloth:
+  # 16-bit LoRA recommended for H100 (plenty of VRAM)
+  # Set to true for smaller GPUs
+  load_in_4bit: false
+  
+  # FP8 training - 1.4x faster on H100, ~60% less model memory
+  # Requires H100/H200/A100/RTX 40xx
+  use_fp8: false  # Set true for maximum speed
+  
+  # vLLM memory utilization - Unsloth Standby handles the rest
+  # With UNSLOTH_VLLM_STANDBY=1, you can set this high
+  gpu_memory_utilization: 0.85
+  
+  # FP8 KV cache - 2x less KV cache memory on H100
+  use_fp8_kv_cache: true
+
+# LoRA Configuration
+lora:
+  r: 32  # Larger rank for better learning capacity
+  alpha: 32
+  dropout: 0.0  # 0 is optimized in Unsloth
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+# Stockfish Configuration
+stockfish:
+  path: "/usr/games/stockfish"
+  depth: 20  # Depth 20 for full reward
+  threads: 8  # H100 systems usually have good CPUs
+  hash_mb: 512
+
+# Reward Configuration
+reward:
+  # Stockfish match rewards
+  top1_reward: 1.0     # Matches Stockfish best move
+  top3_reward: 0.7     # In top 3 moves
+  top5_reward: 0.4     # In top 5 moves
+  legal_reward: 0.1    # Legal but not in top 5
+  illegal_penalty: -0.5
+  no_move_penalty: -1.0
+  
+  # Format rewards (stacked with move rewards)
+  format_bonus: 0.2      # Correct <think>...</think><uci_move>...</uci_move>
+  format_penalty: -0.1   # Wrong format
+  xml_bonus: 0.1         # Exactly one of each tag
+  xml_penalty: -0.2      # Wrong tag count
+
+# Data Configuration  
+data:
+  # Game positions
+  games_dataset: "Lichess/standard-chess-games"
+  min_elo: 800  # Include beginner games
+  sample_rate: 0.3
+  skip_first_moves: 4
+  skip_last_moves: 2
+  
+  # Puzzle positions
+  puzzles_dataset: "Lichess/chess-puzzles"
+  min_puzzle_rating: 800
+  max_puzzle_rating: 2500
+  puzzle_ratio: 0.3  # 30% puzzles, 70% games
+  
+  # ELO weighting (includes lower levels)
+  elo_weights:
+    800: 0.08
+    1000: 0.10
+    1200: 0.12
+    1400: 0.15
+    1600: 0.18
+    1800: 0.20
+    2000: 0.18
+    2200: 0.12
+    2400: 0.08
+  
+  num_train_samples: 50000
+
+# GRPO Training Configuration - Optimized for H100
+training:
+  # Batch settings
+  # GRPO typically uses batch_size=1, relies on gradient accumulation
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 4
+  
+  # GRPO specific - more generations = better advantage estimation
+  num_generations: 8
+  max_prompt_length: 512
+  max_completion_length: 2048  # Your reasoning trace limit
+  
+  # Generation parameters
+  temperature: 0.7
+  beta: 0.04  # KL penalty coefficient
+  
+  # Optimizer - paged_adamw_8bit is memory efficient
+  learning_rate: 5.0e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+  optim: paged_adamw_8bit
+  
+  # Training duration
+  # For GRPO, expect ~300+ steps to see reward improvement
+  # 12+ hours training recommended for good results
+  num_train_epochs: 1
+  max_steps: -1  # Use num_train_epochs
+  
+  # Gradient clipping
+  max_grad_norm: 0.1
+  
+  # Logging - log every step to monitor reward
+  logging_steps: 1
+  save_steps: 500
+  
+  # vLLM integration (Unsloth handles automatically)
+  use_vllm: true
+  
+  # Output
+  output_dir: "./chess_grpo_h100_output"
+
+# H100 Specific Notes:
+# ===================
+# 
+# Memory Budget (approximate for 4B model):
+# - Model weights (16-bit LoRA): ~8GB
+# - LoRA adapters: ~0.5GB
+# - Optimizer states: ~2GB (with paged_adamw_8bit)
+# - Gradients: ~8GB
+# - vLLM KV cache (with FP8): ~4GB per 2K context
+# - GRPO logits (8 generations): ~10GB (Unsloth optimizes this)
+# - Buffer: ~10GB
+# Total: ~45-50GB, leaving ~30GB headroom
+#
+# Throughput expectations:
+# - With vLLM: ~2000-4000 tokens/s generation
+# - Training step: ~5-15 seconds depending on completion length
+# - 50K samples * 1 epoch = ~5-15 hours
+#
+# If you run out of memory:
+# 1. Reduce num_generations from 8 to 6 or 4
+# 2. Enable load_in_4bit: true
+# 3. Reduce max_completion_length
+# 4. Reduce gpu_memory_utilization to 0.7

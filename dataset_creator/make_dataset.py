@@ -48,7 +48,7 @@ def main() -> int:
     parser.add_argument(
         "--config",
         type=str,
-        default=str(Path("configs") / "config_stockfish_traces_full.yaml"),
+        default=str(ROOT / "configs" / "config_stockfish_traces_full.yaml"),
         help="Path to YAML config (relative paths are resolved from the current working directory).",
     )
     parser.add_argument(
@@ -119,7 +119,13 @@ def main() -> int:
 
     from src.utils.stockfish_eval import StockfishEvaluator
 
-    config = load_yaml_config(Path(args.config))
+    config_path = Path(args.config)
+    if not config_path.is_absolute() and not config_path.exists():
+        candidate = (ROOT / config_path).resolve()
+        if candidate.exists():
+            config_path = candidate
+
+    config = load_yaml_config(config_path)
 
     stockfish_cfg = config.get("stockfish", {})
     data_cfg = config.get("data", {})

@@ -1,0 +1,4 @@
+# Modal deployment requirements
+# Install with: pip install -r requirements.txt
+
+modal>=0.73.0

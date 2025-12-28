@@ -1,0 +1,22 @@
+# Core training
+torch>=2.1.0
+transformers>=4.51.0
+trl>=0.25.0
+datasets>=2.14.0
+accelerate>=0.27.0
+peft>=0.10.0
+
+# Optimizations
+flash-attn>=2.5.0
+liger-kernel>=0.2.0
+
+# Chess evaluation
+python-chess>=1.10.0
+
+# Logging and tracking
+wandb>=0.16.0
+huggingface_hub>=0.20.0
+
+# Utilities
+numpy>=1.24.0
+tqdm>=4.65.0
