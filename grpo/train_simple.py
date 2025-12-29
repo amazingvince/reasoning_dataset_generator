@@ -47,13 +47,30 @@ LEARNING_RATE = 5e-6
 
 # Global Stockfish engine (initialized once)
 STOCKFISH_ENGINE = None
+STOCKFISH_RESTARTS = 0
 
 
 def init_stockfish():
-    global STOCKFISH_ENGINE
-    if STOCKFISH_ENGINE is None:
-        STOCKFISH_ENGINE = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
-        STOCKFISH_ENGINE.configure({"Threads": 4, "Hash": 256})
+    """Initialize or reinitialize Stockfish engine with retry logic."""
+    global STOCKFISH_ENGINE, STOCKFISH_RESTARTS
+
+    # Clean up existing engine if it exists but is unresponsive
+    if STOCKFISH_ENGINE is not None:
+        try:
+            STOCKFISH_ENGINE.ping()
+            return  # Engine is alive
+        except Exception:
+            # Engine is dead, clean up
+            try:
+                STOCKFISH_ENGINE.quit()
+            except Exception:
+                pass
+            STOCKFISH_ENGINE = None
+            STOCKFISH_RESTARTS += 1
+
+    # Initialize new engine
+    STOCKFISH_ENGINE = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+    STOCKFISH_ENGINE.configure({"Threads": 4, "Hash": 256})
 
 
 def extract_move(text: str) -> str | None:
@@ -62,39 +79,51 @@ def extract_move(text: str) -> str | None:
     return match.group(1).lower() if match else None
 
 
+def _extract_prompt_text(prompt) -> str:
+    """Extract text content from prompt (handles both string and chat format)."""
+    if isinstance(prompt, list):
+        # Chat format: list of message dicts
+        for msg in prompt:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                return msg.get("content", "")
+        return " ".join(msg.get("content", "") for msg in prompt if isinstance(msg, dict))
+    return str(prompt)
+
+
 def stockfish_reward(completions, prompts, **kwargs) -> list[float]:
     """
     Main reward function using Stockfish.
-    
-    Rewards:
-    - 1.0: Matches Stockfish top move
-    - 0.7: In top 3
-    - 0.4: In top 5
+
+    Rewards (rebalanced per 2025 best practices):
+    - 1.5: Matches Stockfish top move
+    - 1.0: In top 3
+    - 0.6: In top 5
     - 0.1: Legal but not top 5
     - -0.5: Illegal move
     - -1.0: No move found
     """
     init_stockfish()
     rewards = []
-    
+
     for completion, prompt in zip(completions, prompts):
-        # Handle TRL completion format
+        # Handle TRL completion format (string or chat format)
         text = completion[0]["content"] if isinstance(completion, list) else str(completion)
-        
-        # Extract FEN from prompt
-        fen_match = re.search(r'FEN:\s*([^\n]+)', prompt)
+
+        # Extract FEN from prompt (handles both string and chat format)
+        prompt_text = _extract_prompt_text(prompt)
+        fen_match = re.search(r'FEN:\s*([^\n]+)', prompt_text)
         if not fen_match:
             rewards.append(-1.0)
             continue
-        
+
         fen = fen_match.group(1).strip()
         predicted_move = extract_move(text)
-        
+
         # No move extracted
         if not predicted_move:
             rewards.append(-1.0)
             continue
-        
+
         # Check if legal
         try:
             board = chess.Board(fen)
@@ -102,87 +131,102 @@ def stockfish_reward(completions, prompts, **kwargs) -> list[float]:
             if move not in board.legal_moves:
                 rewards.append(-0.5)
                 continue
-        except:
+        except (ValueError, chess.IllegalMoveError, chess.InvalidMoveError):
             rewards.append(-0.5)
             continue
-        
-        # Get Stockfish top moves
+
+        # Get Stockfish top moves with retry logic
         try:
+            init_stockfish()  # Ensure engine is alive
             result = STOCKFISH_ENGINE.analyse(
                 board,
                 chess.engine.Limit(depth=STOCKFISH_DEPTH),
                 multipv=5
             )
             top_moves = [pv["pv"][0].uci() for pv in result if "pv" in pv and pv["pv"]]
-        except:
+        except chess.engine.EngineTerminatedError:
+            global STOCKFISH_ENGINE
+            STOCKFISH_ENGINE = None  # Force restart on next call
             rewards.append(0.1)  # Fallback: legal but couldn't analyze
             continue
-        
-        # Score based on ranking
+        except Exception as e:
+            rewards.append(0.1)  # Fallback: legal but couldn't analyze
+            continue
+
+        # Score based on ranking (rebalanced rewards)
         if predicted_move == top_moves[0]:
-            rewards.append(1.0)
+            rewards.append(1.5)
         elif predicted_move in top_moves[:3]:
-            rewards.append(0.7)
+            rewards.append(1.0)
         elif predicted_move in top_moves:
-            rewards.append(0.4)
+            rewards.append(0.6)
         else:
             rewards.append(0.1)
-    
+
     return rewards
 
 
 def format_reward(completions, **kwargs) -> list[float]:
-    """Reward for proper XML format."""
+    """Reward for proper XML format (reduced to avoid masking move quality)."""
     rewards = []
     pattern = r'<think>[\s\S]*?</think>\s*<uci_move>[a-h][1-8][a-h][1-8][qrbn]?</uci_move>'
-    
+
     for completion in completions:
         text = completion[0]["content"] if isinstance(completion, list) else str(completion)
-        rewards.append(0.2 if re.search(pattern, text, re.I) else -0.1)
-    
+        # Reduced format bonus per 2025 best practices
+        rewards.append(0.1 if re.search(pattern, text, re.I) else -0.1)
+
     return rewards
 
 
 # ============================================================================
-# Dataset Creation (Simplified)
+# Dataset Creation (Simplified) - Chat format per TRL 2025 recommendations
 # ============================================================================
 
-def create_simple_dataset(num_samples: int = 1000) -> Dataset:
-    """Create a simple dataset from Lichess puzzles."""
-    from datasets import load_dataset
-    
-    print(f"Loading {num_samples} puzzle positions...")
-    
-    puzzles = load_dataset("Lichess/chess-puzzles", split="train", streaming=True)
-    positions = []
-    
-    for puzzle in puzzles:
-        if len(positions) >= num_samples:
-            break
-        
-        fen = puzzle.get("FEN")
-        if not fen:
-            continue
-        
-        try:
-            board = chess.Board(fen)
-            legal_moves = " ".join(sorted([m.uci() for m in board.legal_moves]))
-        except:
-            continue
-        
-        prompt = f"""You are an expert chess player. Choose the best move.
-FEN: {fen}
-Legal moves (UCI): {legal_moves}
+SYSTEM_CONTENT = """You are an expert chess player. Analyze the position and choose the best move.
 Rules:
 - Put all reasoning inside <think>...</think>.
 - Output exactly one <uci_move>...</uci_move> tag with a single move.
 - Do not output anything after </uci_move>.
 Output format:
 <think>...</think>
-<uci_move>...</uci_move>
-"""
+<uci_move>...</uci_move>"""
+
+
+def create_simple_dataset(num_samples: int = 1000) -> Dataset:
+    """Create a simple dataset from Lichess puzzles using chat format."""
+    from datasets import load_dataset
+
+    print(f"Loading {num_samples} puzzle positions...")
+
+    puzzles = load_dataset("Lichess/chess-puzzles", split="train", streaming=True)
+    positions = []
+
+    for puzzle in puzzles:
+        if len(positions) >= num_samples:
+            break
+
+        fen = puzzle.get("FEN")
+        if not fen:
+            continue
+
+        try:
+            board = chess.Board(fen)
+            # Skip positions with no legal moves
+            if not list(board.legal_moves):
+                continue
+            legal_moves = " ".join(sorted([m.uci() for m in board.legal_moves]))
+        except ValueError:
+            # Invalid FEN
+            continue
+
+        # Chat format per TRL 2025 recommendations
+        prompt = [
+            {"role": "system", "content": SYSTEM_CONTENT},
+            {"role": "user", "content": f"FEN: {fen}\nLegal moves (UCI): {legal_moves}\n\nChoose the best move."},
+        ]
         positions.append({"prompt": prompt, "fen": fen})
-    
+
     print(f"Created dataset with {len(positions)} positions")
     return Dataset.from_list(positions)
 
@@ -233,8 +277,8 @@ def main():
     # Create dataset
     dataset = create_simple_dataset(args.samples)
     
-    # GRPO config
-    print("\nConfiguring GRPO trainer...")
+    # GRPO config with 2025 best practices (DAPO loss)
+    print("\nConfiguring GRPO trainer with DAPO loss...")
     training_args = GRPOConfig(
         output_dir=OUTPUT_DIR,
         per_device_train_batch_size=1,
@@ -243,7 +287,18 @@ def main():
         max_prompt_length=512,
         max_completion_length=MAX_COMPLETION_LENGTH,
         temperature=0.7,
-        beta=0.04,
+        # 2025 best practices: beta=0 (no KL penalty with verifiable rewards)
+        beta=0.0,
+        # Batch-level reward scaling is more robust
+        scale_rewards="batch",
+        # Ignore truncated outputs in loss
+        mask_truncated_completions=True,
+        # DAPO loss configuration (2025 best practice for reasoning tasks)
+        # DAPO achieved 50% on AIME 2024 vs 30% baseline
+        loss_type="dapo",
+        # Asymmetric clipping (DAPO Clip-Higher strategy)
+        epsilon=0.2,       # Lower bound for suppression
+        epsilon_high=0.28,  # Upper bound for encouragement
         learning_rate=LEARNING_RATE,
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
@@ -276,6 +331,9 @@ def main():
     print(f"  Learning rate: {LEARNING_RATE}")
     print()
     print("TIP: Wait 300+ steps before expecting reward improvement")
+    print("NOTE: Using DAPO loss with 2025 best practices")
+    print("      - Asymmetric clipping (epsilon=0.2, epsilon_high=0.28)")
+    print("      - No KL penalty (beta=0), batch-level reward scaling")
     print("=" * 60 + "\n")
     
     try:

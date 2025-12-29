@@ -126,9 +126,24 @@ class ChessGRPOConfig:
     max_steps: int = -1  # Use epochs
     
     # GRPO hyperparameters
-    beta: float = 0.04  # KL penalty coefficient
+    # beta=0.0 per 2025 research (Open-Reasoner-Zero, DAPO, Understanding R1-Zero)
+    # With verifiable rewards like Stockfish, KL penalty is unnecessary
+    beta: float = 0.0
     temperature: float = 0.7
-    
+    # scale_rewards="batch" is more robust than per-group normalization
+    scale_rewards: str = "batch"
+    # Ignore truncated outputs in loss computation
+    mask_truncated_completions: bool = True
+
+    # DAPO loss configuration (2025 best practice for reasoning tasks)
+    # loss_type options: "grpo" (default TRL), "dapo", "sapo", "dr_grpo", "bnpo"
+    loss_type: str = "dapo"
+    # Asymmetric clipping (DAPO Clip-Higher strategy)
+    # epsilon: lower bound for suppression (standard)
+    # epsilon_high: upper bound for encouragement (allows more exploration)
+    epsilon: float = 0.2
+    epsilon_high: float = 0.28
+
     # Logging and saving
     logging_steps: int = 1
     save_steps: int = 500
@@ -137,17 +152,18 @@ class ChessGRPOConfig:
     # Output
     output_dir: str = "./chess_grpo_h100_output"
     
-    # Reward weights
-    reward_top1: float = 1.0
-    reward_top3: float = 0.7
-    reward_top5: float = 0.4
+    # Reward weights (rebalanced to emphasize move quality)
+    reward_top1: float = 1.5
+    reward_top3: float = 1.0
+    reward_top5: float = 0.6
     reward_legal: float = 0.1
     reward_illegal: float = -0.5
     reward_no_move: float = -1.0
-    reward_format_bonus: float = 0.2
+    # Format rewards reduced to avoid masking move quality signal
+    reward_format_bonus: float = 0.1
     reward_format_penalty: float = -0.1
-    reward_xml_bonus: float = 0.1
-    reward_xml_penalty: float = -0.2
+    reward_xml_bonus: float = 0.05
+    reward_xml_penalty: float = -0.15
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "ChessGRPOConfig":
@@ -283,6 +299,17 @@ class ChessGRPOConfig:
             config.temperature = as_float(training["temperature"], config.temperature)
         if "beta" in training:
             config.beta = as_float(training["beta"], config.beta)
+        if "scale_rewards" in training:
+            config.scale_rewards = str(training["scale_rewards"])
+        if "mask_truncated_completions" in training:
+            config.mask_truncated_completions = as_bool(training["mask_truncated_completions"], config.mask_truncated_completions)
+        # DAPO loss configuration
+        if "loss_type" in training:
+            config.loss_type = str(training["loss_type"])
+        if "epsilon" in training:
+            config.epsilon = as_float(training["epsilon"], config.epsilon)
+        if "epsilon_high" in training:
+            config.epsilon_high = as_float(training["epsilon_high"], config.epsilon_high)
         if "learning_rate" in training:
             config.learning_rate = as_float(training["learning_rate"], config.learning_rate)
         if "weight_decay" in training:
@@ -407,7 +434,8 @@ def iter_game_positions(config: ChessGRPOConfig, seed: int) -> Iterator[Dict[str
             if move_idx < config.skip_first_moves:
                 try:
                     board.push_san(move_san)
-                except Exception:
+                except (chess.IllegalMoveError, chess.InvalidMoveError, ValueError) as e:
+                    logger.debug(f"Invalid opening move {move_san}: {e}")
                     break
                 continue
             
@@ -416,13 +444,16 @@ def iter_game_positions(config: ChessGRPOConfig, seed: int) -> Iterator[Dict[str
             
             try:
                 if rng.random() <= config.sample_rate:
-                    yield {
-                        "fen": board.fen(),
-                        "source": "game",
-                        "avg_elo": avg_elo,
-                    }
+                    # Validate position has legal moves before yielding
+                    if list(board.legal_moves):
+                        yield {
+                            "fen": board.fen(),
+                            "source": "game",
+                            "avg_elo": avg_elo,
+                        }
                 board.push_san(move_san)
-            except Exception:
+            except (chess.IllegalMoveError, chess.InvalidMoveError, ValueError) as e:
+                logger.debug(f"Invalid move {move_san} at position {move_idx}: {e}")
                 break
 
 
@@ -452,27 +483,34 @@ def iter_puzzle_positions(config: ChessGRPOConfig) -> Iterator[Dict[str, Any]]:
         
         try:
             board = chess.Board(fen)
-        except Exception:
+        except ValueError:
+            # Invalid FEN string
             continue
-        
+
+        # Skip positions with no legal moves
+        if not list(board.legal_moves):
+            continue
+
         for idx, move_uci in enumerate(moves):
             try:
                 move = chess.Move.from_uci(move_uci)
             except ValueError:
                 break
-            
+
             if move not in board.legal_moves:
                 break
-            
+
             if idx % 2 == 1:
-                yield {
-                    "fen": board.fen(),
-                    "source": "puzzle",
-                    "puzzle_id": str(puzzle_id) if puzzle_id else None,
-                    "puzzle_rating": rating,
-                    "puzzle_themes": themes,
-                }
-            
+                # Validate position has legal moves before yielding
+                if list(board.legal_moves):
+                    yield {
+                        "fen": board.fen(),
+                        "source": "puzzle",
+                        "puzzle_id": str(puzzle_id) if puzzle_id else None,
+                        "puzzle_rating": rating,
+                        "puzzle_themes": themes,
+                    }
+
             board.push(move)
 
 
@@ -524,12 +562,10 @@ def create_dataset(config: ChessGRPOConfig, seed: int = 42) -> Dataset:
 
 
 # ============================================================================
-# Prompt Formatting
+# Prompt Formatting (Chat format per TRL 2025 recommendations)
 # ============================================================================
 
-CHESS_SYSTEM_PROMPT = """You are an expert chess player. Choose the best move.
-FEN: {fen}
-Legal moves (UCI): {legal_moves}
+CHESS_SYSTEM_CONTENT = """You are an expert chess player. Analyze the position and choose the best move.
 Rules:
 - Put all reasoning inside <think>...</think>.
 - Output exactly one <uci_move>...</uci_move> tag with a single move copied from the legal moves list (no spaces).
@@ -537,19 +573,43 @@ Rules:
 - Do not output "resign".
 Output format:
 <think>...</think>
-<uci_move>...</uci_move>
-"""
+<uci_move>...</uci_move>"""
+
+CHESS_USER_TEMPLATE = """FEN: {fen}
+Legal moves (UCI): {legal_moves}
+
+Choose the best move."""
 
 
-def format_chess_prompt(fen: str) -> str:
-    """Format a FEN into the model's prompt format."""
+def format_chess_prompt(fen: str) -> list[dict[str, str]]:
+    """Format a FEN into chat format for GRPO training.
+
+    Returns a list of message dicts per TRL conversational format.
+    """
     try:
         board = chess.Board(fen)
         legal_moves = " ".join(sorted([m.uci() for m in board.legal_moves]))
-    except Exception:
+    except ValueError:
+        # Invalid FEN - return empty legal moves
         legal_moves = ""
-    
-    return CHESS_SYSTEM_PROMPT.format(fen=fen, legal_moves=legal_moves)
+
+    return [
+        {"role": "system", "content": CHESS_SYSTEM_CONTENT},
+        {"role": "user", "content": CHESS_USER_TEMPLATE.format(fen=fen, legal_moves=legal_moves)},
+    ]
+
+
+def format_chess_prompt_string(fen: str) -> str:
+    """Legacy string format for backward compatibility and FEN extraction in rewards."""
+    try:
+        board = chess.Board(fen)
+        legal_moves = " ".join(sorted([m.uci() for m in board.legal_moves]))
+    except ValueError:
+        # Invalid FEN - return empty legal moves
+        legal_moves = ""
+
+    return f"""FEN: {fen}
+Legal moves (UCI): {legal_moves}"""
 
 
 def extract_uci_move(text: str) -> Optional[str]:
@@ -567,20 +627,31 @@ def extract_uci_move(text: str) -> Optional[str]:
 # ============================================================================
 
 class StockfishRewardEngine:
-    """Stockfish-based reward computation."""
-    
+    """Stockfish-based reward computation with automatic recovery."""
+
+    MAX_RETRIES = 3
+
     def __init__(self, config: ChessGRPOConfig):
         self.config = config
         self.engine = None
         self._init_engine()
-        
+
         # Stats tracking
         self.stats = {
             "total": 0, "top1": 0, "top3": 0, "top5": 0,
-            "legal": 0, "illegal": 0, "no_move": 0
+            "legal": 0, "illegal": 0, "no_move": 0, "engine_restarts": 0
         }
-    
+
     def _init_engine(self):
+        """Initialize or reinitialize Stockfish engine."""
+        # Clean up existing engine if any
+        if self.engine is not None:
+            try:
+                self.engine.quit()
+            except Exception:
+                pass
+            self.engine = None
+
         try:
             self.engine = chess.engine.SimpleEngine.popen_uci(self.config.stockfish_path)
             self.engine.configure({
@@ -591,38 +662,70 @@ class StockfishRewardEngine:
         except Exception as e:
             logger.error(f"Failed to init Stockfish: {e}")
             raise
+
+    def _ensure_engine_alive(self) -> bool:
+        """Check if engine is alive and restart if necessary."""
+        if self.engine is None:
+            self._init_engine()
+            self.stats["engine_restarts"] += 1
+            return True
+
+        try:
+            # Ping the engine to check if it's responsive
+            self.engine.ping()
+            return True
+        except Exception as e:
+            logger.warning(f"Stockfish engine unresponsive: {e}. Restarting...")
+            self._init_engine()
+            self.stats["engine_restarts"] += 1
+            return True
     
     def get_top_moves(self, fen: str, n: int = 5) -> List[tuple]:
-        """Get top N moves with scores."""
-        try:
-            board = chess.Board(fen)
-            result = self.engine.analyse(
-                board,
-                chess.engine.Limit(depth=self.config.stockfish_depth),
-                multipv=n
-            )
-            if isinstance(result, dict):
-                result = [result]
-            
-            moves = []
-            for pv in result:
-                if "pv" in pv and pv["pv"]:
-                    move = pv["pv"][0].uci()
-                    pov_score = pv.get("score")
-                    cp = 0
-                    if pov_score is not None:
-                        relative = getattr(pov_score, "relative", pov_score)
-                        if relative.is_mate():
-                            mate_in = relative.mate()
-                            cp = 30000 if mate_in and mate_in > 0 else -30000
-                        else:
-                            score_cp = relative.score()
-                            cp = int(score_cp) if score_cp is not None else 0
-                    moves.append((move, cp))
-            return moves
-        except Exception as e:
-            logger.warning(f"Analysis failed for {fen}: {e}")
-            return []
+        """Get top N moves with scores. Includes retry logic for engine failures."""
+        last_error = None
+
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                self._ensure_engine_alive()
+                board = chess.Board(fen)
+                result = self.engine.analyse(
+                    board,
+                    chess.engine.Limit(depth=self.config.stockfish_depth),
+                    multipv=n
+                )
+                if isinstance(result, dict):
+                    result = [result]
+
+                moves = []
+                for pv in result:
+                    if "pv" in pv and pv["pv"]:
+                        move = pv["pv"][0].uci()
+                        pov_score = pv.get("score")
+                        cp = 0
+                        if pov_score is not None:
+                            relative = getattr(pov_score, "relative", pov_score)
+                            if relative.is_mate():
+                                mate_in = relative.mate()
+                                cp = 30000 if mate_in and mate_in > 0 else -30000
+                            else:
+                                score_cp = relative.score()
+                                cp = int(score_cp) if score_cp is not None else 0
+                        moves.append((move, cp))
+                return moves
+
+            except chess.engine.EngineTerminatedError as e:
+                last_error = e
+                logger.warning(f"Engine terminated on attempt {attempt + 1}/{self.MAX_RETRIES}: {e}")
+                self.engine = None  # Force restart on next attempt
+
+            except Exception as e:
+                last_error = e
+                if attempt < self.MAX_RETRIES - 1:
+                    logger.warning(f"Analysis attempt {attempt + 1}/{self.MAX_RETRIES} failed for {fen}: {e}")
+                else:
+                    logger.warning(f"Analysis failed after {self.MAX_RETRIES} attempts for {fen}: {e}")
+
+        return []
     
     def compute_single_reward(self, fen: str, predicted_move: Optional[str]) -> float:
         """Compute reward for a single prediction."""
@@ -634,7 +737,8 @@ class StockfishRewardEngine:
         
         try:
             board = chess.Board(fen)
-        except Exception:
+        except ValueError:
+            # Invalid FEN string
             self.stats["no_move"] += 1
             return self.config.reward_no_move
         
@@ -678,7 +782,8 @@ class StockfishRewardEngine:
                 f"Top3: {self.stats['top3']/total:.1%}, "
                 f"Top5: {self.stats['top5']/total:.1%}, "
                 f"Legal: {self.stats['legal']/total:.1%}, "
-                f"Illegal: {self.stats['illegal']/total:.1%}"
+                f"Illegal: {self.stats['illegal']/total:.1%}, "
+                f"Engine restarts: {self.stats['engine_restarts']}"
             )
     
     def close(self):
@@ -694,39 +799,52 @@ def create_reward_functions(config: ChessGRPOConfig):
     """
     stockfish = StockfishRewardEngine(config)
     
+    def _extract_prompt_text(prompt) -> str:
+        """Extract text content from prompt (handles both string and chat format)."""
+        if isinstance(prompt, list):
+            # Chat format: list of message dicts
+            # Find the user message which contains the FEN
+            for msg in prompt:
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    return msg.get("content", "")
+            # Fallback: concatenate all content
+            return " ".join(msg.get("content", "") for msg in prompt if isinstance(msg, dict))
+        return str(prompt)
+
     # Main Stockfish reward function
     def stockfish_reward_func(completions, prompts, **kwargs):
         """
         Stockfish-based move quality reward.
-        
+
         Args:
-            completions: List of model completions
-            prompts: List of prompts (contains FEN)
-        
+            completions: List of model completions (string or chat format)
+            prompts: List of prompts (string or chat format, contains FEN)
+
         Returns:
             List of float rewards
         """
         rewards = []
-        
+
         for completion, prompt in zip(completions, prompts):
             # Handle completion format (could be string or list of dicts)
             if isinstance(completion, list):
                 text = completion[0].get("content", "") if completion else ""
             else:
                 text = str(completion)
-            
-            # Extract FEN from prompt
-            fen_match = re.search(r'FEN:\s*([^\n]+)', prompt)
+
+            # Extract FEN from prompt (handles both string and chat format)
+            prompt_text = _extract_prompt_text(prompt)
+            fen_match = re.search(r'FEN:\s*([^\n]+)', prompt_text)
             if not fen_match:
                 rewards.append(config.reward_no_move)
                 continue
-            
+
             fen = fen_match.group(1).strip()
             predicted_move = extract_uci_move(text)
-            
+
             reward = stockfish.compute_single_reward(fen, predicted_move)
             rewards.append(reward)
-        
+
         return rewards
     
     # Format reward - encourages proper <think>...</think><uci_move>...</uci_move> format
@@ -867,7 +985,15 @@ def main(config: Optional[ChessGRPOConfig] = None):
         max_completion_length=config.max_completion_length,
         temperature=config.temperature,
         beta=config.beta,
-        
+        # 2025 best practices: batch-level reward scaling and mask truncated outputs
+        scale_rewards=config.scale_rewards,
+        mask_truncated_completions=config.mask_truncated_completions,
+
+        # DAPO loss configuration (2025 best practice for reasoning tasks)
+        loss_type=config.loss_type,
+        epsilon=config.epsilon,
+        epsilon_high=config.epsilon_high,
+
         # vLLM integration (Unsloth handles this)
         use_vllm=config.use_vllm,
         

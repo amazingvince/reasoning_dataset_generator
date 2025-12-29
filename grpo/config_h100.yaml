@@ -45,20 +45,21 @@ stockfish:
   hash_mb: 512
 
 # Reward Configuration
+# Rebalanced to emphasize move quality over format compliance
 reward:
-  # Stockfish match rewards
-  top1_reward: 1.0     # Matches Stockfish best move
-  top3_reward: 0.7     # In top 3 moves
-  top5_reward: 0.4     # In top 5 moves
+  # Stockfish match rewards (increased to dominate reward signal)
+  top1_reward: 1.5     # Matches Stockfish best move
+  top3_reward: 1.0     # In top 3 moves
+  top5_reward: 0.6     # In top 5 moves
   legal_reward: 0.1    # Legal but not in top 5
   illegal_penalty: -0.5
   no_move_penalty: -1.0
-  
-  # Format rewards (stacked with move rewards)
-  format_bonus: 0.2      # Correct <think>...</think><uci_move>...</uci_move>
+
+  # Format rewards (reduced to avoid masking move quality signal)
+  format_bonus: 0.1      # Correct <think>...</think><uci_move>...</uci_move>
   format_penalty: -0.1   # Wrong format
-  xml_bonus: 0.1         # Exactly one of each tag
-  xml_penalty: -0.2      # Wrong tag count
+  xml_bonus: 0.05        # Exactly one of each tag
+  xml_penalty: -0.15     # Wrong tag count
 
 # Data Configuration  
 data:
@@ -103,9 +104,31 @@ training:
   
   # Generation parameters
   temperature: 0.7
-  beta: 0.04  # KL penalty coefficient
-  
+
+  # KL penalty - set to 0.0 per 2025 research (Open-Reasoner-Zero, DAPO, etc.)
+  # With verifiable rewards like Stockfish, KL penalty is unnecessary and suppresses exploration
+  beta: 0.0
+
+  # Reward scaling - "batch" is more robust than per-group normalization
+  # Per Understanding R1-Zero-Like Training paper
+  scale_rewards: "batch"
+
+  # Ignore truncated outputs in loss computation
+  mask_truncated_completions: true
+
+  # DAPO Loss Configuration (2025 best practice for reasoning tasks)
+  # loss_type options: "grpo", "dapo", "sapo", "dr_grpo", "bnpo"
+  # DAPO achieved 50% on AIME 2024 vs 30% baseline
+  loss_type: "dapo"
+
+  # Asymmetric clipping (DAPO Clip-Higher strategy)
+  # epsilon: lower bound for suppression (standard PPO/GRPO value)
+  # epsilon_high: upper bound for encouragement (allows more exploration for low-prob tokens)
+  epsilon: 0.2
+  epsilon_high: 0.28
+
   # Optimizer - paged_adamw_8bit is memory efficient
+  # Note: DAPO paper uses learning_rate: 1.0e-6, but 5e-6 works well with LoRA
   learning_rate: 5.0e-6
   weight_decay: 0.1
   warmup_ratio: 0.1

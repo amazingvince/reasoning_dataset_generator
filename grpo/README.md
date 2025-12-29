@@ -1,6 +1,34 @@
 # Chess GRPO Training - Unsloth + Single H100
 
-Train your chess LLM using **GRPO (Group Relative Policy Optimization)** with **Stockfish rewards** on a **single H100 80GB GPU**.
+Train your chess LLM using **GRPO (Group Relative Policy Optimization)** with **DAPO loss** and **Stockfish rewards** on a **single H100 80GB GPU**.
+
+This implementation uses **2025 best practices** from recent research including DAPO, Open-Reasoner-Zero, and Understanding R1-Zero-Like Training.
+
+## 2025 Best Practices
+
+This implementation incorporates findings from recent RL research:
+
+### DAPO Loss (Decoupled Clip and Dynamic Sampling)
+
+We use **DAPO loss** instead of standard GRPO, based on [ByteDance's research](https://arxiv.org/abs/2503.14476) showing **50% on AIME 2024** vs 30% baseline.
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| `loss_type` | `"dapo"` | Asymmetric clipping prevents entropy collapse |
+| `epsilon` | `0.2` | Lower bound for suppressing bad actions |
+| `epsilon_high` | `0.28` | Higher bound encourages exploration of good actions |
+| `beta` | `0.0` | No KL penalty - unnecessary with verifiable rewards |
+| `scale_rewards` | `"batch"` | Batch-level normalization avoids difficulty bias |
+
+### Why These Settings?
+
+**No KL Penalty (beta=0.0)**: Multiple 2025 papers (Open-Reasoner-Zero, DAPO, Understanding R1-Zero-Like Training) show that with verifiable rewards like Stockfish, KL penalty suppresses exploration without benefit. We have ground-truth verification, not a reward model that could be over-optimized.
+
+**Asymmetric Clipping**: Standard PPO/GRPO uses symmetric clipping (epsilon=0.2 both ways). DAPO's "Clip-Higher" strategy uses epsilon_high=0.28 for the upper bound, allowing the model to more aggressively reinforce good moves while conservatively suppressing bad ones.
+
+**Batch-Level Reward Scaling**: Per-group normalization can cause difficulty bias (easy puzzles get same weight as hard ones). Batch-level scaling is more robust.
+
+**Mask Truncated Completions**: Outputs that hit the length limit shouldn't contribute to the loss - they may be mid-thought.
 
 ## Why Unsloth?
 
@@ -84,28 +112,40 @@ unsloth:
   gpu_memory_utilization: 0.85
 
 training:
+  # DAPO loss (2025 best practice)
+  loss_type: "dapo"
+  epsilon: 0.2         # Lower bound (suppression)
+  epsilon_high: 0.28   # Upper bound (encouragement)
+  beta: 0.0            # No KL penalty
+  scale_rewards: "batch"
+  mask_truncated_completions: true
+
+  # Generation
   num_generations: 8
   max_completion_length: 2048
+  temperature: 0.7
   learning_rate: 5.0e-6
 ```
 
 ## Reward Function
 
-Stockfish-based reward with format bonuses:
+Stockfish-based reward with format bonuses (rebalanced to emphasize move quality):
 
 ```python
-# Move quality (main reward)
-Top 1 match:  +1.0
-Top 3 match:  +0.7
-Top 5 match:  +0.4
-Legal move:   +0.1
+# Move quality (main reward - increased weights)
+Top 1 match:  +1.5   # Matches Stockfish best move
+Top 3 match:  +1.0   # Strong alternative
+Top 5 match:  +0.6   # Reasonable move
+Legal move:   +0.1   # Legal but not in top 5
 Illegal:      -0.5
 No move:      -1.0
 
-# Format (stacked)
-Correct format: +0.2
+# Format (reduced to avoid masking move quality)
+Correct format: +0.1   # <think>...</think><uci_move>...</uci_move>
 Wrong format:   -0.1
 ```
+
+**Why rebalanced?** The original format bonus (+0.3 combined) could mask poor move quality. A model outputting correct format but bad moves would score similarly to one with good moves but formatting issues. The new weights ensure move quality dominates the reward signal.
 
 ## Training Tips
 
@@ -113,6 +153,7 @@ Wrong format:   -0.1
 2. **12+ hours** training recommended for good results
 3. **Monitor rewards** - they should trend upward
 4. **Log every step** (`logging_steps: 1`) to track progress
+5. **DAPO helps exploration** - asymmetric clipping prevents the model from collapsing to a single response pattern
 
 ## Troubleshooting
 
@@ -170,7 +211,15 @@ After training:
 
 ## References
 
+### Implementation
 - [Unsloth GRPO Documentation](https://docs.unsloth.ai/get-started/reinforcement-learning-rl-guide)
 - [Unsloth Memory-Efficient RL](https://docs.unsloth.ai/get-started/reinforcement-learning-rl-guide/memory-efficient-rl)
 - [TRL GRPOTrainer](https://huggingface.co/docs/trl/main/en/grpo_trainer)
-- [DeepSeekMath GRPO Paper](https://arxiv.org/abs/2402.03300)
+
+### 2025 Research (Configuration Choices)
+- [DAPO: Decoupled Clip and Dynamic Sampling](https://arxiv.org/abs/2503.14476) - Asymmetric clipping, 50% AIME 2024
+- [Open-Reasoner-Zero](https://huggingface.co/papers/2503.24290) - Beta=0 for verifiable rewards
+- [Understanding R1-Zero-Like Training](https://huggingface.co/papers/2503.20783) - Batch-level reward scaling
+
+### Original Papers
+- [DeepSeekMath GRPO Paper](https://arxiv.org/abs/2402.03300) - Original GRPO algorithm
