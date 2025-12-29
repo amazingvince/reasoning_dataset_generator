@@ -670,8 +670,12 @@ class StockfishRewardEngine:
         # Stats tracking
         self.stats = {
             "total": 0, "top1": 0, "top3": 0, "top5": 0,
-            "legal": 0, "illegal": 0, "no_move": 0, "engine_restarts": 0
+            "legal": 0, "illegal": 0, "no_move": 0, "engine_restarts": 0,
+            "cache_hits": 0, "cache_misses": 0
         }
+        # LRU cache for FEN -> top moves (avoids re-analyzing same position in rollouts)
+        self._cache: dict[str, List[tuple]] = {}
+        self._cache_maxsize = 10000
 
     def _init_engine(self):
         """Initialize or reinitialize Stockfish engine."""
@@ -712,7 +716,13 @@ class StockfishRewardEngine:
             return True
     
     def get_top_moves(self, fen: str, n: int = 5) -> List[tuple]:
-        """Get top N moves with scores. Includes retry logic for engine failures."""
+        """Get top N moves with scores. Uses cache for repeated positions."""
+        # Check cache first
+        if fen in self._cache:
+            self.stats["cache_hits"] += 1
+            return self._cache[fen]
+
+        self.stats["cache_misses"] += 1
         last_error = None
 
         for attempt in range(self.MAX_RETRIES):
@@ -721,7 +731,7 @@ class StockfishRewardEngine:
                 board = chess.Board(fen)
                 result = self.engine.analyse(
                     board,
-                    chess.engine.Limit(depth=self.config.stockfish_depth),
+                    chess.engine.Limit(depth=self.config.stockfish_depth, time=5.0),
                     multipv=n
                 )
                 if isinstance(result, dict):
@@ -742,6 +752,13 @@ class StockfishRewardEngine:
                                 score_cp = relative.score()
                                 cp = int(score_cp) if score_cp is not None else 0
                         moves.append((move, cp))
+
+                # Cache the result (simple LRU: evict oldest if full)
+                if len(self._cache) >= self._cache_maxsize:
+                    # Remove first (oldest) item
+                    oldest_key = next(iter(self._cache))
+                    del self._cache[oldest_key]
+                self._cache[fen] = moves
                 return moves
 
             except chess.engine.EngineTerminatedError as e:
@@ -807,6 +824,8 @@ class StockfishRewardEngine:
     
     def log_stats(self):
         total = self.stats["total"]
+        cache_total = self.stats["cache_hits"] + self.stats["cache_misses"]
+        cache_rate = self.stats["cache_hits"] / cache_total if cache_total > 0 else 0
         if total > 0:
             logger.info(
                 f"Rewards - Top1: {self.stats['top1']/total:.1%}, "
@@ -814,7 +833,9 @@ class StockfishRewardEngine:
                 f"Top5: {self.stats['top5']/total:.1%}, "
                 f"Legal: {self.stats['legal']/total:.1%}, "
                 f"Illegal: {self.stats['illegal']/total:.1%}, "
-                f"Engine restarts: {self.stats['engine_restarts']}"
+                f"NoMove: {self.stats['no_move']/total:.1%}, "
+                f"Cache hit: {cache_rate:.1%}, "
+                f"Restarts: {self.stats['engine_restarts']}"
             )
     
     def close(self):
@@ -857,8 +878,21 @@ def create_reward_functions(config: ChessGRPOConfig):
         Returns:
             List of float rewards
         """
-        rewards = []
+        # Pre-extract all unique FENs and warm the cache
+        unique_fens = set()
+        for prompt in prompts:
+            prompt_text = _extract_prompt_text(prompt)
+            fen_match = re.search(r'FEN:\s*([^\n]+)', prompt_text)
+            if fen_match:
+                unique_fens.add(fen_match.group(1).strip())
 
+        # Pre-analyze unique FENs (warms cache, avoids redundant analysis)
+        if unique_fens and _debug_counter["count"] <= 10:
+            print(f"[stockfish] Pre-analyzing {len(unique_fens)} unique positions for {len(completions)} completions", flush=True)
+        for fen in unique_fens:
+            stockfish.get_top_moves(fen)  # This caches the result
+
+        rewards = []
         for completion, prompt in zip(completions, prompts):
             # Handle completion format (could be string or list of dicts)
             if isinstance(completion, list):
@@ -894,13 +928,20 @@ def create_reward_functions(config: ChessGRPOConfig):
             if _debug_counter["count"] <= 5:
                 print(f"FEN: {fen}", flush=True)
                 print(f"Extracted move: {predicted_move}", flush=True)
-                print(f"{'='*60}\n", flush=True)
+                print(f"Computing Stockfish reward...", flush=True)
 
             reward = stockfish.compute_single_reward(fen, predicted_move)
+
+            if _debug_counter["count"] <= 5:
+                print(f"Reward: {reward}", flush=True)
+                print(f"{'='*60}\n", flush=True)
+
             rewards.append(reward)
 
+        if _debug_counter["count"] <= 10:
+            print(f"[stockfish_reward_func] Completed {len(rewards)} rewards", flush=True)
         return rewards
-    
+
     # Format reward - encourages proper <think>...</think><uci_move>...</uci_move> format
     def format_reward_func(completions, **kwargs):
         """Reward for proper output format."""
@@ -918,9 +959,11 @@ def create_reward_functions(config: ChessGRPOConfig):
                 rewards.append(config.reward_format_bonus)  # Small bonus for correct format
             else:
                 rewards.append(config.reward_format_penalty)  # Small penalty for wrong format
-        
+
+        if _debug_counter["count"] <= 10:
+            print(f"[format_reward_func] Completed {len(rewards)} rewards", flush=True)
         return rewards
-    
+
     # XML tag count reward - ensures exactly one of each tag
     def xml_count_reward_func(completions, **kwargs):
         """Reward for having exactly one of each XML tag."""
@@ -930,17 +973,19 @@ def create_reward_functions(config: ChessGRPOConfig):
                 text = completion[0].get("content", "") if completion else ""
             else:
                 text = str(completion)
-            
+
             think_count = len(re.findall(r'<think>', text, re.IGNORECASE))
             think_close = len(re.findall(r'</think>', text, re.IGNORECASE))
             move_count = len(re.findall(r'<uci_move>', text, re.IGNORECASE))
             move_close = len(re.findall(r'</uci_move>', text, re.IGNORECASE))
-            
+
             if think_count == 1 and think_close == 1 and move_count == 1 and move_close == 1:
                 rewards.append(config.reward_xml_bonus)
             else:
                 rewards.append(config.reward_xml_penalty)
-        
+
+        if _debug_counter["count"] <= 10:
+            print(f"[xml_count_reward_func] Completed {len(rewards)} rewards", flush=True)
         return rewards
     
     # Attach cleanup
