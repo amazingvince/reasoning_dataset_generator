@@ -27,8 +27,9 @@ unsloth:
   # With UNSLOTH_VLLM_STANDBY=1, you can set this high
   gpu_memory_utilization: 0.85
 
-  # FP8 KV cache - 2x less KV cache memory on H100
-  use_fp8_kv_cache: true
+  # FP8 KV cache - must match model dtype (use_fp8)
+  # FlashInfer doesn't support mixed BF16 queries + FP8 KV cache
+  use_fp8_kv_cache: false
 
 # LoRA Configuration
 lora:

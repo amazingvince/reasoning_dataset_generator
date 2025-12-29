@@ -947,6 +947,13 @@ def main(config: Optional[ChessGRPOConfig] = None):
     logger.info(f"Mode: {'LoRA' if config.use_lora else 'Full Fine-tuning'}")
     logger.info(f"Using Unsloth with vLLM fast inference")
 
+    # FP8 KV cache requires FP8 model weights (FlashInfer limitation)
+    # Mixed BF16 queries + FP8 KV cache causes compilation errors
+    use_fp8_kv = config.use_fp8_kv_cache
+    if use_fp8_kv and not config.use_fp8:
+        logger.warning("FP8 KV cache requires FP8 model weights. Disabling FP8 KV cache.")
+        use_fp8_kv = False
+
     # Build model loading kwargs
     model_kwargs = {
         "model_name": config.model_name,
@@ -955,7 +962,7 @@ def main(config: Optional[ChessGRPOConfig] = None):
         "load_in_fp8": config.use_fp8,
         "fast_inference": config.use_vllm,
         "gpu_memory_utilization": config.gpu_memory_utilization,
-        "float8_kv_cache": config.use_fp8_kv_cache,
+        "float8_kv_cache": use_fp8_kv,
     }
     # Only set max_lora_rank when using LoRA
     if config.use_lora:

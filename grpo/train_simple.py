@@ -258,6 +258,8 @@ def main():
     
     # Load model with Unsloth
     print(f"\nLoading model: {args.model}")
+    # FP8 KV cache requires FP8 model (FlashInfer limitation)
+    use_fp8_kv = args.use_fp8  # Only enable if model is FP8
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model,
         max_seq_length=4096,
@@ -266,7 +268,7 @@ def main():
         fast_inference=True,  # Enable vLLM
         max_lora_rank=32,
         gpu_memory_utilization=0.85,
-        float8_kv_cache=True,  # 2x less KV cache on H100
+        float8_kv_cache=use_fp8_kv,
     )
     
     # Add LoRA
