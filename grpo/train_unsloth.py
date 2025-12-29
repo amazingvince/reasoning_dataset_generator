@@ -838,6 +838,9 @@ def create_reward_functions(config: ChessGRPOConfig):
             return " ".join(msg.get("content", "") for msg in prompt if isinstance(msg, dict))
         return str(prompt)
 
+    # Debug counter for logging samples
+    _debug_counter = {"count": 0}
+
     # Main Stockfish reward function
     def stockfish_reward_func(completions, prompts, **kwargs):
         """
@@ -859,15 +862,29 @@ def create_reward_functions(config: ChessGRPOConfig):
             else:
                 text = str(completion)
 
+            # Debug: log first few completions to see what model is generating
+            _debug_counter["count"] += 1
+            if _debug_counter["count"] <= 5:
+                logger.info(f"[DEBUG] Completion type: {type(completion)}")
+                logger.info(f"[DEBUG] Completion sample ({len(text)} chars): {text[:500]}...")
+                if len(text) > 500:
+                    logger.info(f"[DEBUG] ...end: {text[-200:]}")
+
             # Extract FEN from prompt (handles both string and chat format)
             prompt_text = _extract_prompt_text(prompt)
             fen_match = re.search(r'FEN:\s*([^\n]+)', prompt_text)
             if not fen_match:
+                if _debug_counter["count"] <= 5:
+                    logger.warning(f"[DEBUG] No FEN found in prompt: {prompt_text[:300]}...")
                 rewards.append(config.reward_no_move)
                 continue
 
             fen = fen_match.group(1).strip()
             predicted_move = extract_uci_move(text)
+
+            if _debug_counter["count"] <= 5:
+                logger.info(f"[DEBUG] FEN: {fen}")
+                logger.info(f"[DEBUG] Extracted move: {predicted_move}")
 
             reward = stockfish.compute_single_reward(fen, predicted_move)
             rewards.append(reward)
