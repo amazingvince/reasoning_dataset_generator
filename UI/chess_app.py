@@ -3,7 +3,7 @@ Chess LLM App - Modal deployment with vLLM and GPU Memory Snapshots
 Serves amazingvince/chess_qwen3_4b_reasoning_v2 for chess games
 
 Features:
-- GPU memory snapshots for ~10x faster cold starts (45s -> 5s typical)
+- GPU memory snapshots for ~10x faster cold starts
 - Streaming LLM reasoning
 - Play as White or Black
 - Opening book support (12 openings)
@@ -11,9 +11,9 @@ Features:
 Deploy with: modal deploy chess_app.py
 Run locally: modal serve chess_app.py
 
-GPU Snapshot Notes:
-- First few cold starts will be slower as snapshots are created
-- After snapshot creation, subsequent starts are dramatically faster
+Snapshot Notes:
+- vLLM sleep mode is disabled (avoid FlashInfer sleep bug: vllm#31016)
+- Snapshots capture the running vLLM server without sleep/wake
 - Requires deployed app (snapshots don't work with `modal run`)
 """
 
@@ -26,10 +26,19 @@ import modal
 
 # --- Configuration ---
 MODEL_NAME = os.environ.get("CHESS_MODEL_NAME", "amazingvince/chess_qwen3_4b_reasoning_v2")
-GPU_TYPE = os.environ.get("CHESS_GPU", "T4")
+GPU_TYPE = os.environ.get("CHESS_GPU", "A10G")
 N_GPU = 1
 MINUTES = 60
 VLLM_PORT = 8000
+CONTAINER_TIMEOUT_MINUTES = int(os.environ.get("CHESS_CONTAINER_TIMEOUT_MINUTES", "30"))
+VLLM_STARTUP_TIMEOUT_SECONDS = int(os.environ.get("CHESS_VLLM_STARTUP_TIMEOUT_SECONDS", str(20 * MINUTES)))
+VLLM_RESTORE_TIMEOUT_SECONDS = int(os.environ.get("CHESS_VLLM_RESTORE_TIMEOUT_SECONDS", "300"))
+VLLM_MAX_MODEL_LEN = int(os.environ.get("CHESS_VLLM_MAX_MODEL_LEN", "4096"))
+VLLM_MAX_NUM_SEQS = int(os.environ.get("CHESS_VLLM_MAX_NUM_SEQS", "4"))
+VLLM_MAX_NUM_BATCHED_TOKENS = int(
+    os.environ.get("CHESS_VLLM_MAX_NUM_BATCHED_TOKENS", str(VLLM_MAX_MODEL_LEN))
+)
+VLLM_PROMPT_HEADROOM = int(os.environ.get("CHESS_VLLM_PROMPT_HEADROOM", "256"))
 
 # Snapshot version - change this to invalidate cached snapshots
 SNAPSHOT_VERSION = os.environ.get("CHESS_SNAPSHOT_VERSION", "v1")
@@ -112,20 +121,25 @@ OPENING_BOOK = {
 
 # --- Build the container image ---
 vllm_image = (
+    # Match Modal's latest vLLM + GPU snapshot examples.
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
     .entrypoint([])
-    .pip_install(
-        "vllm==0.8.5",
-        "huggingface_hub[hf_transfer]",
-        "flashinfer-python==0.2.2",
+    .uv_pip_install(
+        "vllm~=0.11.2",
+        "huggingface-hub==0.36.0",
+        "flashinfer-python==0.5.2",
         "requests>=2.31.0",
     )
     .env({
-        "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        # vLLM sleep mode for GPU snapshots
-        "VLLM_SERVER_DEV_MODE": "1",
-        # Improve torch compile compatibility with snapshots
+        # Faster model transfers (matches Modal examples).
+        "HF_XET_HIGH_PERFORMANCE": "1",
+        # Improve torch compile compatibility with snapshots.
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
+        # Avoid noisy torch.distributed/NCCL watchdog warnings after snapshot restore.
+        "TORCH_NCCL_ENABLE_MONITORING": "0",
+        "TORCH_DISTRIBUTED_DEBUG": "OFF",
+        "TORCH_NCCL_DUMP_ON_TIMEOUT": "0",
+        "TORCH_NCCL_DESYNC_DEBUG": "0",
     })
 )
 
@@ -141,180 +155,188 @@ with vllm_image.imports():
     import requests as http_requests
 
 
-def wait_for_server(proc: subprocess.Popen, timeout: int = 300) -> bool:
-    """Wait for vLLM server to be ready by polling the health endpoint"""
+def wait_for_server(proc: subprocess.Popen | None = None, timeout: int = 300) -> bool:
+    """Wait for vLLM server to be ready by polling the health endpoint."""
     import time
+
     start = time.time()
     while time.time() - start < timeout:
         try:
             socket.create_connection(("localhost", VLLM_PORT), timeout=1).close()
-            # Double-check with health endpoint
+            # Double-check with health endpoint.
             try:
                 resp = http_requests.get(f"http://localhost:{VLLM_PORT}/health", timeout=5)
                 if resp.status_code == 200:
                     return True
-            except:
+            except Exception:
                 pass
         except OSError:
             pass
-        
-        # Check if process died
-        if proc.poll() is not None:
+
+        # Check if process died.
+        if proc is not None and proc.poll() is not None:
             raise RuntimeError(f"vLLM process exited with code {proc.returncode}")
-        
+
         time.sleep(1)
-    
+
     raise TimeoutError(f"vLLM server did not start within {timeout}s")
 
 
-def sleep_vllm(level: int = 1):
-    """Put vLLM server to sleep for snapshotting (offloads weights to CPU)"""
-    http_requests.post(
-        f"http://localhost:{VLLM_PORT}/sleep?level={level}",
-        timeout=60
-    ).raise_for_status()
-
-
-def wake_vllm():
-    """Wake up vLLM server after snapshot restore"""
-    http_requests.post(
-        f"http://localhost:{VLLM_PORT}/wake_up",
-        timeout=60
-    ).raise_for_status()
-
-
-def warmup_vllm():
-    """Warmup the server to capture JIT compilation artifacts in snapshot"""
+def warmup_vllm() -> None:
+    """Warmup the server to capture JIT compilation artifacts in snapshot."""
+    warmup_timeout = int(os.environ.get("CHESS_VLLM_WARMUP_REQUEST_TIMEOUT_SECONDS", "240"))
     payload = {
         "model": "llm",
-        "messages": [{"role": "user", "content": "e4"}],
+        "prompt": "You are an expert chess player. Choose the best move.\n"
+        "FEN: rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1\n"
+        "Legal moves (UCI): a7a6 a7a5 b7b6 b7b5 c7c6 c7c5 d7d6 d7d5 e7e6 "
+        "e7e5 f7f6 f7f5 g7g6 g7g5 h7h6 h7h5\n\n"
+        "Rules:\n"
+        "- Put all reasoning inside <think>...</think>.\n"
+        "- Output exactly one <uci_move>...</uci_move> tag with a single move "
+        "copied from the legal moves list (no spaces).\n"
+        "- Do not output anything after the closing </uci_move>.\n\n"
+        "Output format:\n"
+        "<think>...</think>\n"
+        "<uci_move>...</uci_move>\n\n"
+        "<think>",
         "max_tokens": 32,
-        "temperature": 0.7,
+        "temperature": 0.0,
+        "stop": ["</uci_move>"],
     }
-    # Run a few warmup requests
     for _ in range(3):
         http_requests.post(
-            f"http://localhost:{VLLM_PORT}/v1/chat/completions",
+            f"http://localhost:{VLLM_PORT}/v1/completions",
             json=payload,
-            timeout=120,
+            timeout=warmup_timeout,
         ).raise_for_status()
+
+
+def clamp_max_tokens(requested: int) -> int:
+    """Keep some prompt headroom so OpenAI renderer doesn't see max_length=0."""
+    max_allowed = max(1, VLLM_MAX_MODEL_LEN - VLLM_PROMPT_HEADROOM)
+    return max(1, min(requested, max_allowed))
 
 
 # --- vLLM Server with GPU Memory Snapshots ---
 @app.cls(
     image=vllm_image,
-    gpu=GPU_TYPE,  # T4 is sufficient for 4B model, cost-effective
+    gpu=GPU_TYPE,
     scaledown_window=5 * MINUTES,
-    timeout=10 * MINUTES,
+    timeout=CONTAINER_TIMEOUT_MINUTES * MINUTES,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
         "/root/.cache/vllm": vllm_cache_vol,
     },
-    # Enable GPU memory snapshots for faster cold starts
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
-    allow_concurrent_inputs=10,
 )
+@modal.concurrent(max_inputs=10)
 class ChessLLMServer:
     """
     vLLM server with GPU memory snapshot support.
-    
+
     The snapshot workflow:
-    1. start_and_snapshot (snap=True): Start vLLM, warmup, then sleep
-    2. Modal creates a GPU memory snapshot
-    3. On restore, wake_after_restore (snap=False) wakes the server
-    4. Subsequent cold starts skip model loading entirely (~10x faster)
+    1. start (snap=True): Start vLLM and warm it up
+    2. Modal takes a CPU+GPU memory snapshot of the running server
+    3. Subsequent cold starts restore from the snapshot (no re-load)
     """
-    
+
     @modal.enter(snap=True)
-    def start_and_snapshot(self):
-        """Start vLLM server, warmup for JIT compilation, then sleep for snapshot"""
+    def start(self):
+        """Start vLLM server and warm it up so it can be snapshotted."""
         print(f"[{SNAPSHOT_VERSION}] Starting vLLM server for {MODEL_NAME}...")
-        
+
         cmd = [
-            "vllm", "serve",
+            "vllm",
+            "serve",
+            "--uvicorn-log-level=info",
             MODEL_NAME,
-            "--served-model-name", "llm",
-            "--host", "0.0.0.0",
-            "--port", str(VLLM_PORT),
-            "--gpu-memory-utilization", "0.9",
-            "--max-model-len", "4096",
+            "--served-model-name",
+            MODEL_NAME,
+            "llm",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(VLLM_PORT),
+            "--gpu_memory_utilization",
+            "0.90",
+            "--max-model-len",
+            str(VLLM_MAX_MODEL_LEN),
+            "--max-num-seqs",
+            str(VLLM_MAX_NUM_SEQS),
+            "--max-num-batched-tokens",
+            str(VLLM_MAX_NUM_BATCHED_TOKENS),
             "--trust-remote-code",
-            # Snapshot-friendly settings
-            "--enable-sleep-mode",  # Required for sleep/wake
-            "--max-num-seqs", "4",  # Smaller KV cache for faster snapshot
-            "--max-num-batched-tokens", "4096",
         ]
-        
-        print(f"Command: {' '.join(cmd)}")
-        self.vllm_proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        
+        cmd += ["--tensor-parallel-size", str(N_GPU)]
+
+        print("Command:", " ".join(cmd))
+        self.vllm_proc = subprocess.Popen(cmd)
+
         print("Waiting for vLLM server to be ready...")
-        wait_for_server(self.vllm_proc, timeout=300)
+        wait_for_server(self.vllm_proc, timeout=VLLM_STARTUP_TIMEOUT_SECONDS)
         print("✓ Server is ready!")
-        
-        print("Warming up model for JIT compilation...")
+
+        print("Warming up model for snapshot...")
         warmup_vllm()
         print("✓ Warmup complete!")
-        
-        print("Putting server to sleep for snapshot...")
-        sleep_vllm()
-        print("✓ Server is asleep, ready for GPU memory snapshot!")
-    
+
+        # Commit cache volumes before snapshot to avoid CRIU mount issues
+        print("Committing cache volumes before snapshot...")
+        vllm_cache_vol.commit()
+        hf_cache_vol.commit()
+        print("✓ Cache volumes committed!")
+
     @modal.enter(snap=False)
-    def wake_after_restore(self):
-        """Wake server after snapshot restore - this runs on every restored container"""
-        print("Waking up vLLM server after snapshot restore...")
-        wake_vllm()
-        # Quick health check
-        wait_for_server(self.vllm_proc, timeout=30)
-        print("✓ Server is awake and ready!")
-    
+    def after_restore(self):
+        """Verify server after snapshot restore."""
+        print("Verifying vLLM server after snapshot restore...")
+        wait_for_server(getattr(self, "vllm_proc", None), timeout=VLLM_RESTORE_TIMEOUT_SECONDS)
+        print("✓ vLLM is ready!")
+
     @modal.method()
     def generate(self, prompt: str) -> str:
-        """Generate completion from the LLM (non-streaming)"""
+        """Generate completion from the LLM (non-streaming)."""
         full_prompt = prompt.rstrip() + "\n<think>"
-        
+        max_tokens = clamp_max_tokens(int(os.environ.get("CHESS_VLLM_MAX_TOKENS", "2048")))
+
         payload = {
             "model": "llm",
             "prompt": full_prompt,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
             "temperature": 0.7,
             "top_p": 0.8,
             "top_k": 20,
             "repetition_penalty": 1.05,
             "stop": ["</uci_move>"],
         }
-        
+
         response = http_requests.post(
             f"http://localhost:{VLLM_PORT}/v1/completions",
             json=payload,
             timeout=120,
         )
         response.raise_for_status()
-        
         result = response.json()
         text = result["choices"][0]["text"]
-        
+
         # Add back closing tag if truncated
         if "<uci_move>" in text and "</uci_move>" not in text:
             text += "</uci_move>"
-        
+
         return "<think>" + text
-    
+
     @modal.method()
     def generate_streaming(self, prompt: str):
-        """Generate with streaming for real-time UI updates"""
+        """Generate with streaming for real-time UI updates."""
         full_prompt = prompt.rstrip() + "\n<think>"
-        
+        max_tokens = clamp_max_tokens(int(os.environ.get("CHESS_VLLM_STREAM_MAX_TOKENS", "4096")))
+
         payload = {
             "model": "llm",
             "prompt": full_prompt,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
             "temperature": 0.7,
             "top_p": 0.8,
             "top_k": 20,
@@ -322,7 +344,7 @@ class ChessLLMServer:
             "stream": True,
             "stop": ["</uci_move>"],
         }
-        
+
         response = http_requests.post(
             f"http://localhost:{VLLM_PORT}/v1/completions",
             json=payload,
@@ -330,13 +352,13 @@ class ChessLLMServer:
             timeout=120,
         )
         response.raise_for_status()
-        
+
         full_text = "<think>"
         yield full_text
-        
+
         for line in response.iter_lines():
             if line:
-                line = line.decode('utf-8')
+                line = line.decode("utf-8")
                 if line.startswith("data: "):
                     data = line[6:]
                     if data == "[DONE]":
@@ -349,15 +371,15 @@ class ChessLLMServer:
                             yield text
                     except json.JSONDecodeError:
                         continue
-        
+
         # Add closing tag if needed
         if "<uci_move>" in full_text and "</uci_move>" not in full_text:
             yield "</uci_move>"
-    
+
     @modal.exit()
     def shutdown(self):
-        """Clean shutdown of vLLM server"""
-        if hasattr(self, 'vllm_proc') and self.vllm_proc:
+        """Clean shutdown of vLLM server."""
+        if hasattr(self, "vllm_proc") and self.vllm_proc:
             print("Shutting down vLLM server...")
             self.vllm_proc.terminate()
             try:
@@ -380,6 +402,7 @@ web_image = (
 
 
 @app.function(image=web_image)
+@modal.concurrent(max_inputs=100)
 @modal.asgi_app()
 def web():
     from fastapi import FastAPI, HTTPException
@@ -389,7 +412,6 @@ def web():
     from pydantic import BaseModel
     import chess
     import asyncio
-    import uuid
     
     web_app = FastAPI(title="Chess LLM Game")
     
@@ -400,87 +422,79 @@ def web():
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    
-    # Game state storage (in-memory)
-    games: dict = {}
-    
+
     class GameConfig(BaseModel):
         player_color: str = "white"
         opening: str = "starting"
     
     class MoveRequest(BaseModel):
-        game_id: str
+        fen: str
         move: str
+        player_color: str = "white"
     
-    class GameState:
-        def __init__(self, player_color: str = "white", opening: str = "starting"):
-            self.board = chess.Board()
-            self.player_color = player_color
-            self.opening = opening
-            self.move_history = []
-            self.reasoning_history = []
-            
-            # Apply opening moves
-            if opening in OPENING_BOOK:
-                for uci_move in OPENING_BOOK[opening]["moves"]:
-                    move = chess.Move.from_uci(uci_move)
-                    if move in self.board.legal_moves:
-                        self.board.push(move)
-                        self.move_history.append(uci_move)
-        
-        def get_fen(self) -> str:
-            return self.board.fen()
-        
-        def get_legal_moves_uci(self) -> list[str]:
-            return [move.uci() for move in self.board.legal_moves]
-        
-        def make_move(self, uci_move: str) -> bool:
-            try:
+    def board_from_opening(opening: str) -> tuple[chess.Board, list[str]]:
+        board = chess.Board()
+        move_history: list[str] = []
+        if opening in OPENING_BOOK:
+            for uci_move in OPENING_BOOK[opening]["moves"]:
                 move = chess.Move.from_uci(uci_move)
-                if move in self.board.legal_moves:
-                    self.board.push(move)
-                    self.move_history.append(uci_move)
-                    return True
-                return False
-            except:
-                return False
-        
-        def is_game_over(self) -> dict:
-            return {
-                "is_over": self.board.is_game_over(),
-                "is_checkmate": self.board.is_checkmate(),
-                "is_stalemate": self.board.is_stalemate(),
-                "is_draw": self.board.is_insufficient_material() or 
-                          self.board.can_claim_fifty_moves() or 
-                          self.board.can_claim_threefold_repetition(),
-                "winner": "white" if self.board.is_checkmate() and not self.board.turn else 
-                         "black" if self.board.is_checkmate() else None
-            }
-        
-        def is_player_turn(self) -> bool:
-            if self.player_color == "white":
-                return self.board.turn  # True = white's turn
-            else:
-                return not self.board.turn
-        
-        def build_llm_prompt(self) -> str:
-            fen = self.get_fen()
-            legal_moves = " ".join(sorted(self.get_legal_moves_uci()))
-            
-            return f"""You are an expert chess player. Choose the best move.
-FEN: {fen}
-Legal moves (UCI): {legal_moves}
+                if move in board.legal_moves:
+                    board.push(move)
+                    move_history.append(uci_move)
+        return board, move_history
 
-Rules:
-- Put all reasoning inside <think>...</think>.
-- Output exactly one <uci_move>...</uci_move> tag with a single move copied from the legal moves list (no spaces).
-- Do not output anything after the closing </uci_move>.
-- Do not output "resign".
+    def board_from_fen(fen: str) -> chess.Board:
+        try:
+            return chess.Board(fen)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid FEN")
 
-Output format:
-<think>...</think>
-<uci_move>...</uci_move>
-"""
+    def legal_moves_uci(board: chess.Board) -> list[str]:
+        return [move.uci() for move in board.legal_moves]
+
+    def game_over(board: chess.Board) -> dict:
+        return {
+            "is_over": board.is_game_over(),
+            "is_checkmate": board.is_checkmate(),
+            "is_stalemate": board.is_stalemate(),
+            "is_draw": board.is_insufficient_material()
+            or board.can_claim_fifty_moves()
+            or board.can_claim_threefold_repetition(),
+            "winner": "white" if board.is_checkmate() and not board.turn else
+            "black" if board.is_checkmate() else None,
+        }
+
+    def is_player_turn(board: chess.Board, player_color: str) -> bool:
+        if player_color == "white":
+            return board.turn  # True = white's turn
+        return not board.turn
+
+    def serialize_board(board: chess.Board, player_color: str) -> dict:
+        return {
+            "fen": board.fen(),
+            "legal_moves": legal_moves_uci(board),
+            "game_over": game_over(board),
+            "is_player_turn": is_player_turn(board, player_color),
+        }
+
+    def build_llm_prompt(board: chess.Board) -> str:
+        fen = board.fen()
+        legal_moves = " ".join(sorted(legal_moves_uci(board)))
+
+        return f"""You are an expert chess player. Choose the best move.
+    FEN: {fen}
+    Legal moves (UCI): {legal_moves}
+    
+    Rules:
+    - Put all reasoning inside <think>...</think>.
+    - Output exactly one <uci_move>...</uci_move> tag with a single move copied from the legal moves list (no spaces).
+    - Do not output anything after the closing </uci_move>.
+    - Do not output "resign".
+    
+    Output format:
+    <think>...</think>
+    <uci_move>...</uci_move>
+    """
     
     def parse_llm_response(response: str) -> tuple:
         think_match = re.search(r'<think>(.*?)</think>', response, re.DOTALL)
@@ -502,51 +516,28 @@ Output format:
     
     @web_app.post("/api/new-game")
     async def new_game(config: GameConfig = GameConfig()):
-        game_id = str(uuid.uuid4())[:8]
-        games[game_id] = GameState(config.player_color, config.opening)
-        
+        board, move_history = board_from_opening(config.opening)
         opening_name = OPENING_BOOK.get(config.opening, OPENING_BOOK["starting"])["name"]
-        
-        return {
-            "game_id": game_id,
-            "fen": games[game_id].get_fen(),
-            "legal_moves": games[game_id].get_legal_moves_uci(),
+        payload = serialize_board(board, config.player_color)
+        payload.update({
             "player_color": config.player_color,
             "opening_name": opening_name,
-            "move_history": games[game_id].move_history,
-            "is_player_turn": games[game_id].is_player_turn()
-        }
+            "move_history": move_history,
+        })
+        return payload
     
-    @web_app.get("/api/game/{game_id}")
-    async def get_game_state(game_id: str):
-        if game_id not in games:
-            raise HTTPException(status_code=404, detail="Game not found")
-        
-        game = games[game_id]
-        return {
-            "fen": game.get_fen(),
-            "legal_moves": game.get_legal_moves_uci(),
-            "game_over": game.is_game_over(),
-            "move_history": game.move_history,
-            "is_player_turn": game.is_player_turn(),
-            "player_color": game.player_color
-        }
-    
-    @web_app.get("/api/llm-move/{game_id}")
-    async def get_llm_move_stream(game_id: str):
+    @web_app.get("/api/llm-move")
+    async def get_llm_move_stream(fen: str, player_color: str = "white"):
         """Stream the LLM's move with reasoning"""
-        if game_id not in games:
-            raise HTTPException(status_code=404, detail="Game not found")
-        
-        game = games[game_id]
-        
-        if game.is_game_over()["is_over"]:
+        board = board_from_fen(fen)
+
+        if game_over(board)["is_over"]:
             raise HTTPException(status_code=400, detail="Game is over")
         
         async def generate():
             try:
                 llm = ChessLLMServer()
-                prompt = game.build_llm_prompt()
+                prompt = build_llm_prompt(board)
                 
                 full_response = ""
                 
@@ -557,7 +548,7 @@ Output format:
                         "event": "chunk",
                         "data": json.dumps({"text": chunk, "done": False})
                     }
-                    await asyncio.sleep(0.02)
+                    await asyncio.sleep(0.01)  # Small delay for UI updates
                 
                 # Parse the complete response
                 reasoning, llm_move = parse_llm_response(full_response)
@@ -566,33 +557,38 @@ Output format:
                 move_success = False
                 final_move = None
                 
-                if llm_move and game.make_move(llm_move):
-                    move_success = True
-                    final_move = llm_move
-                    game.reasoning_history.append(reasoning)
-                else:
+                if llm_move:
+                    try:
+                        move = chess.Move.from_uci(llm_move)
+                        if move in board.legal_moves:
+                            board.push(move)
+                            move_success = True
+                            final_move = llm_move
+                    except Exception:
+                        pass
+
+                if not move_success:
                     # Fallback to random legal move
                     import random
-                    legal = game.get_legal_moves_uci()
+                    legal = legal_moves_uci(board)
                     if legal:
                         fallback = random.choice(legal)
-                        game.make_move(fallback)
+                        board.push(chess.Move.from_uci(fallback))
                         final_move = fallback
                         move_success = True
-                
+
+                payload = serialize_board(board, player_color)
+                payload.update({
+                    "done": True,
+                    "success": move_success,
+                    "move": final_move,
+                    "reasoning": reasoning,
+                })
+
                 # Send final state
                 yield {
                     "event": "complete",
-                    "data": json.dumps({
-                        "done": True,
-                        "success": move_success,
-                        "move": final_move,
-                        "reasoning": reasoning,
-                        "fen": game.get_fen(),
-                        "legal_moves": game.get_legal_moves_uci(),
-                        "game_over": game.is_game_over(),
-                        "is_player_turn": game.is_player_turn()
-                    })
+                    "data": json.dumps(payload)
                 }
                 
             except Exception as e:
@@ -605,54 +601,35 @@ Output format:
     
     @web_app.post("/api/move")
     async def make_player_move(request: MoveRequest):
-        if request.game_id not in games:
-            raise HTTPException(status_code=404, detail="Game not found")
-        
-        game = games[request.game_id]
-        
-        if not game.is_player_turn():
-            return {"success": False, "error": "Not your turn"}
-        
-        if not game.make_move(request.move):
-            return {
+        board = board_from_fen(request.fen)
+
+        try:
+            move = chess.Move.from_uci(request.move)
+        except Exception:
+            move = None
+
+        if move is None or move not in board.legal_moves:
+            payload = serialize_board(board, request.player_color)
+            payload.update({
                 "success": False,
-                "fen": game.get_fen(),
-                "legal_moves": game.get_legal_moves_uci(),
-                "game_over": game.is_game_over(),
-                "error": "Invalid move"
-            }
-        
-        return {
+                "error": "Invalid move",
+            })
+            return payload
+
+        board.push(move)
+        payload = serialize_board(board, request.player_color)
+        payload.update({
             "success": True,
-            "fen": game.get_fen(),
-            "legal_moves": game.get_legal_moves_uci(),
-            "game_over": game.is_game_over(),
-            "is_player_turn": game.is_player_turn()
-        }
-    
-    @web_app.post("/api/reset/{game_id}")
-    async def reset_game(game_id: str):
-        if game_id not in games:
-            raise HTTPException(status_code=404, detail="Game not found")
-        
-        game = games[game_id]
-        player_color = game.player_color
-        opening = game.opening
-        games[game_id] = GameState(player_color, opening)
-        
-        return {
-            "success": True, 
-            "fen": games[game_id].get_fen(),
-            "move_history": games[game_id].move_history,
-            "is_player_turn": games[game_id].is_player_turn()
-        }
+            "move": request.move,
+        })
+        return payload
     
     return web_app
 
 
 def get_chess_html() -> str:
     """Return the complete chess UI HTML"""
-    return '''<!DOCTYPE html>
+    return r'''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -662,7 +639,6 @@ def get_chess_html() -> str:
     <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.13.4/chess.min.js"></script>
     <link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
     <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
     <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
@@ -945,10 +921,11 @@ def get_chess_html() -> str:
         };
         
         function ChessGame() {
-            const [gameId, setGameId] = useState(null);
+            const [gameActive, setGameActive] = useState(false);
             const [status, setStatus] = useState('Configure your game and click "New Game"');
             const [isThinking, setIsThinking] = useState(false);
             const [isPlayerTurn, setIsPlayerTurn] = useState(true);
+            const [fen, setFen] = useState('start');
             const [reasoning, setReasoning] = useState('');
             const [isStreaming, setIsStreaming] = useState(false);
             const [moveHistory, setMoveHistory] = useState([]);
@@ -957,10 +934,39 @@ def get_chess_html() -> str:
             const [selectedOpening, setSelectedOpening] = useState('starting');
             
             const boardRef = useRef(null);
-            const chessRef = useRef(null);
+            const eventSourceRef = useRef(null);
+            const moveListRef = useRef([]);
+            
+            const gameActiveRef = useRef(false);
+            const isThinkingRef = useRef(false);
+            const isPlayerTurnRef = useRef(true);
+            const gameOverRef = useRef(null);
+            const playerColorRef = useRef('white');
+            const fenRef = useRef('start');
+            
+            useEffect(() => { gameActiveRef.current = gameActive; }, [gameActive]);
+            useEffect(() => { isThinkingRef.current = isThinking; }, [isThinking]);
+            useEffect(() => { isPlayerTurnRef.current = isPlayerTurn; }, [isPlayerTurn]);
+            useEffect(() => { gameOverRef.current = gameOver; }, [gameOver]);
+            useEffect(() => { playerColorRef.current = playerColor; }, [playerColor]);
+            useEffect(() => { fenRef.current = fen; }, [fen]);
+            
+            const setMoveHistoryFromList = (moves) => {
+                if (!Array.isArray(moves)) return;
+                moveListRef.current = moves;
+                const pairs = [];
+                for (let i = 0; i < moves.length; i += 2)
+                    pairs.push({ white: moves[i] || null, black: moves[i + 1] || null });
+                setMoveHistory(pairs);
+            };
+            
+            const appendMove = (uciMove) => {
+                if (!uciMove) return;
+                const next = [...moveListRef.current, uciMove];
+                setMoveHistoryFromList(next);
+            };
             
             useEffect(() => {
-                chessRef.current = new Chess();
                 boardRef.current = Chessboard('board', {
                     draggable: true,
                     position: 'start',
@@ -968,77 +974,90 @@ def get_chess_html() -> str:
                     onDragStart, onDrop, onSnapEnd,
                     pieceTheme: 'https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png'
                 });
-                $(window).resize(() => boardRef.current?.resize());
-                return () => boardRef.current?.destroy();
+                const onResize = () => boardRef.current?.resize();
+                $(window).on('resize', onResize);
+                return () => {
+                    try { eventSourceRef.current?.close(); } catch {}
+                    eventSourceRef.current = null;
+                    $(window).off('resize', onResize);
+                    boardRef.current?.destroy();
+                };
             }, []);
             
+            useEffect(() => { boardRef.current?.position(fen); }, [fen]);
             useEffect(() => { boardRef.current?.orientation(playerColor); }, [playerColor]);
             
             const onDragStart = (source, piece) => {
-                if (!gameId || isThinking || !isPlayerTurn || chessRef.current.game_over()) return false;
+                if (!gameActiveRef.current || isThinkingRef.current || !isPlayerTurnRef.current || gameOverRef.current?.is_over) return false;
                 const isWhitePiece = piece.search(/^w/) !== -1;
-                if (playerColor === 'white' && !isWhitePiece) return false;
-                if (playerColor === 'black' && isWhitePiece) return false;
+                if (playerColorRef.current === 'white' && !isWhitePiece) return false;
+                if (playerColorRef.current === 'black' && isWhitePiece) return false;
                 return true;
             };
             
-            const onDrop = async (source, target) => {
-                const move = chessRef.current.move({ from: source, to: target, promotion: 'q' });
-                if (!move) return 'snapback';
+            const onDrop = async (source, target, piece) => {
+                if (!gameActiveRef.current || isThinkingRef.current || !isPlayerTurnRef.current || gameOverRef.current?.is_over) return 'snapback';
+                if (target === 'offboard' || source === target) return 'snapback';
                 
-                const uciMove = source + target + (move.promotion || '');
+                // Always queen-promote for simplicity.
+                let promotion = '';
+                if ((piece === 'wP' || piece === 'bP') && (target[1] === '8' || target[1] === '1')) promotion = 'q';
+                
+                const uciMove = source + target + promotion;
                 try {
                     const response = await fetch('/api/move', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ game_id: gameId, move: uciMove })
+                        body: JSON.stringify({ fen: fenRef.current, move: uciMove, player_color: playerColorRef.current })
                     });
                     const data = await response.json();
                     if (data.success) {
-                        updateMoveHistory(uciMove, null);
-                        if (data.game_over.is_over) {
-                            setGameOver(data.game_over);
+                        if (data.fen) {
+                            setFen(data.fen);
+                            boardRef.current.position(data.fen);
+                        } else {
+                            boardRef.current.position(fenRef.current);
+                        }
+                        
+                        appendMove(uciMove);
+                        if (data.game_over) setGameOver(data.game_over);
+                        
+                        if (data.game_over?.is_over) {
                             setStatus('Game Over!');
+                            setIsPlayerTurn(!!data.is_player_turn);
                         } else {
                             setIsPlayerTurn(false);
                             triggerLLMMove();
                         }
                     } else {
-                        chessRef.current.undo();
-                        boardRef.current.position(chessRef.current.fen());
+                        boardRef.current.position(fenRef.current);
                     }
                 } catch {
-                    chessRef.current.undo();
-                    boardRef.current.position(chessRef.current.fen());
+                    boardRef.current.position(fenRef.current);
                 }
             };
             
-            const onSnapEnd = () => boardRef.current.position(chessRef.current.fen());
-            
-            const updateMoveHistory = (whiteMove, blackMove) => {
-                setMoveHistory(prev => {
-                    const h = [...prev];
-                    if (playerColor === 'white') {
-                        if (whiteMove && !blackMove) h.push({ white: whiteMove, black: null });
-                        else if (blackMove && h.length && h[h.length-1].black === null) h[h.length-1].black = blackMove;
-                    } else {
-                        if (blackMove && !whiteMove) {
-                            if (h.length && h[h.length-1].black === null) h[h.length-1].black = blackMove;
-                            else h.push({ white: null, black: blackMove });
-                        } else if (whiteMove) h.push({ white: whiteMove, black: null });
-                    }
-                    return h;
-                });
-            };
+            const onSnapEnd = () => boardRef.current.position(fenRef.current);
             
             const triggerLLMMove = async () => {
+                if (!gameActiveRef.current) return;
+                const currentFen = fenRef.current;
+                const currentColor = playerColorRef.current;
+                
                 setIsThinking(true);
                 setIsStreaming(true);
                 setStatus('LLM is thinking...');
                 setReasoning('');
                 
+                // Close any previous stream.
+                if (eventSourceRef.current) {
+                    try { eventSourceRef.current.close(); } catch {}
+                    eventSourceRef.current = null;
+                }
+                
                 try {
-                    const es = new EventSource(`/api/llm-move/${gameId}`);
+                    const es = new EventSource(`/api/llm-move?fen=${encodeURIComponent(currentFen)}&player_color=${encodeURIComponent(currentColor)}`);
+                    eventSourceRef.current = es;
                     let fullText = '';
                     
                     es.addEventListener('chunk', e => {
@@ -1050,46 +1069,69 @@ def get_chess_html() -> str:
                     
                     es.addEventListener('complete', e => {
                         const d = JSON.parse(e.data);
-                        es.close();
+                        try { es.close(); } catch {}
+                        if (eventSourceRef.current === es) eventSourceRef.current = null;
+                        
                         setIsStreaming(false);
                         setIsThinking(false);
-                        if (d.success && d.move) {
-                            chessRef.current.load(d.fen);
+                        
+                        if (d?.fen) {
+                            setFen(d.fen);
                             boardRef.current.position(d.fen);
-                            playerColor === 'white' ? updateMoveHistory(null, d.move) : updateMoveHistory(d.move, null);
-                            if (d.reasoning) setReasoning(d.reasoning);
-                            if (d.game_over.is_over) { setGameOver(d.game_over); setStatus('Game Over!'); }
-                            else { setIsPlayerTurn(true); setStatus(`Your turn (${playerColor})`); }
+                        } else {
+                            boardRef.current.position(fenRef.current);
                         }
+                        
+                        if (d?.move) appendMove(d.move);
+                        if (d?.game_over) setGameOver(d.game_over);
+                        if (typeof d?.is_player_turn === 'boolean') setIsPlayerTurn(d.is_player_turn);
+                        if (d?.reasoning) setReasoning(d.reasoning);
+                        
+                        if (d?.game_over?.is_over) setStatus('Game Over!');
+                        else setStatus(`Your turn (${playerColorRef.current})`);
                     });
                     
-                    es.addEventListener('error', () => { es.close(); setIsStreaming(false); setIsThinking(false); setStatus('Error - try again'); });
-                } catch { setIsStreaming(false); setIsThinking(false); setStatus('Error'); }
+                    es.addEventListener('error', () => {
+                        try { es.close(); } catch {}
+                        if (eventSourceRef.current === es) eventSourceRef.current = null;
+                        setIsStreaming(false);
+                        setIsThinking(false);
+                        setStatus('Error - try again');
+                        boardRef.current.position(fenRef.current);
+                    });
+                } catch {
+                    setIsStreaming(false);
+                    setIsThinking(false);
+                    setStatus('Error');
+                    boardRef.current.position(fenRef.current);
+                }
             };
             
-            const startNewGame = async () => {
+            const startNewGame = async (resetOpening = false) => {
+                // Stop any in-flight stream.
+                if (eventSourceRef.current) {
+                    try { eventSourceRef.current.close(); } catch {}
+                    eventSourceRef.current = null;
+                }
+                setIsStreaming(false);
                 setIsThinking(true);
                 setStatus('Starting new game...');
+                const openingToUse = resetOpening ? 'starting' : selectedOpening;
+                if (resetOpening && selectedOpening !== 'starting') setSelectedOpening('starting');
                 try {
                     const r = await fetch('/api/new-game', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ player_color: playerColor, opening: selectedOpening })
+                        body: JSON.stringify({ player_color: playerColor, opening: openingToUse })
                     });
                     const d = await r.json();
-                    setGameId(d.game_id);
-                    setMoveHistory([]);
+                    setGameActive(true);
+                    setMoveHistoryFromList(Array.isArray(d.move_history) ? d.move_history : []);
                     setReasoning('');
                     setGameOver(null);
-                    chessRef.current.load(d.fen);
+                    setFen(d.fen);
                     boardRef.current.position(d.fen);
                     boardRef.current.orientation(playerColor);
-                    if (d.move_history?.length) {
-                        const pairs = [];
-                        for (let i = 0; i < d.move_history.length; i += 2)
-                            pairs.push({ white: d.move_history[i] || null, black: d.move_history[i+1] || null });
-                        setMoveHistory(pairs);
-                    }
                     setIsPlayerTurn(d.is_player_turn);
                     setIsThinking(false);
                     d.is_player_turn ? setStatus(`Your turn (${playerColor})`) : triggerLLMMove();
@@ -1117,13 +1159,13 @@ def get_chess_html() -> str:
                                 <div className="form-group">
                                     <label>Play as</label>
                                     <div className="color-toggle">
-                                        <button className={`color-btn ${playerColor==='white'?'active':''}`} onClick={()=>setPlayerColor('white')} disabled={!!gameId}>♔ White</button>
-                                        <button className={`color-btn ${playerColor==='black'?'active':''}`} onClick={()=>setPlayerColor('black')} disabled={!!gameId}>♚ Black</button>
+                                        <button className={`color-btn ${playerColor==='white'?'active':''}`} onClick={()=>setPlayerColor('white')} disabled={gameActive}>♔ White</button>
+                                        <button className={`color-btn ${playerColor==='black'?'active':''}`} onClick={()=>setPlayerColor('black')} disabled={gameActive}>♚ Black</button>
                                     </div>
                                 </div>
                                 <div className="form-group">
                                     <label>Opening</label>
-                                    <select value={selectedOpening} onChange={e=>setSelectedOpening(e.target.value)} disabled={!!gameId}>
+                                    <select value={selectedOpening} onChange={e=>setSelectedOpening(e.target.value)} disabled={gameActive}>
                                         {Object.entries(OPENINGS).map(([k,v])=><option key={k} value={k}>{v.name}</option>)}
                                     </select>
                                     <div className="opening-desc">{OPENINGS[selectedOpening]?.description}</div>
@@ -1146,7 +1188,7 @@ def get_chess_html() -> str:
                             <div id="board"></div>
                             <div className="controls">
                                 <button className="btn btn-primary" onClick={startNewGame} disabled={isThinking}>New Game</button>
-                                <button className="btn" onClick={()=>{setGameId(null);setMoveHistory([]);setReasoning('');setGameOver(null);chessRef.current.reset();boardRef.current.position('start');setStatus('Configure and click "New Game"');}} disabled={isThinking}>Reset</button>
+                                <button className="btn" onClick={()=>{try{eventSourceRef.current?.close();}catch{}eventSourceRef.current=null;setIsStreaming(false);setIsThinking(false);setGameActive(false);setMoveHistoryFromList([]);setReasoning('');setGameOver(null);setFen('start');setIsPlayerTurn(true);setSelectedOpening('starting');boardRef.current.position('start');setStatus('Configure and click "New Game"');}} disabled={isThinking}>Reset</button>
                             </div>
                         </div>
                         
@@ -1159,11 +1201,11 @@ def get_chess_html() -> str:
                     </div>
                     
                     {gameOver?.is_over && (
-                        <div className="game-over-overlay" onClick={startNewGame}>
+                        <div className="game-over-overlay" onClick={() => startNewGame(true)}>
                             <div className="game-over-modal" onClick={e=>e.stopPropagation()}>
                                 <div className="game-over-title">{getGameOverMessage()}</div>
                                 <div className="game-over-sub">Click to play again</div>
-                                <button className="btn btn-primary" onClick={startNewGame}>New Game</button>
+                                <button className="btn btn-primary" onClick={() => startNewGame(true)}>New Game</button>
                             </div>
                         </div>
                     )}
@@ -1189,10 +1231,9 @@ def main():
     print("\n🔧 DEV MODE:")
     print("    modal serve chess_app.py")
     print("\n✨ FEATURES:")
-    print("  • ⚡ GPU snapshots for ~10x faster cold starts")
+    print("  • ⚡ GPU memory snapshots for faster cold starts")
     print("  • 🔄 Streaming LLM reasoning")
     print("  • ⚪⚫ Play as White or Black")
     print("  • 📖 12 opening positions")
-    print("\n💡 NOTE: First few requests create snapshots (slower).")
-    print("   Subsequent cold starts will be dramatically faster!")
+    print("\n💡 NOTE: vLLM sleep mode is disabled to avoid FlashInfer wake bugs.")
     print("\n" + "=" * 60)

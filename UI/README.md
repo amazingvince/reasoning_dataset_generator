@@ -52,9 +52,15 @@ This app uses Modal's GPU memory snapshots to dramatically reduce cold start tim
 
 ### How It Works
 
-1. **First Cold Start (~45-60s)**: vLLM loads the model, warms up, then sleeps
-2. **Snapshot Creation**: Modal captures GPU + CPU memory state
+1. **First Cold Start (~45-60s)**: vLLM loads the model and runs a warmup request
+2. **Snapshot Creation**: Modal captures GPU + CPU memory (including the running vLLM server)
 3. **Subsequent Starts (~5s)**: Restore from snapshot, skip model loading
+
+By default, this app follows Modal’s latest vLLM snapshot pattern (see the `ministral3_inference` example): it puts vLLM into “sleep mode” during snapshotting (weights offloaded to CPU, KV cache cleared) and wakes on restore.
+
+```bash
+export CHESS_VLLM_SLEEP_MODE=0  # disable sleep mode if you want
+```
 
 ### Key Configuration
 
@@ -67,27 +73,9 @@ This app uses Modal's GPU memory snapshots to dramatically reduce cold start tim
 class ChessLLMServer:
     @modal.enter(snap=True)  # Runs before snapshot
     def start_and_snapshot(self):
-        # Start vLLM, warmup, then sleep
-        ...
-    
-    @modal.enter(snap=False)  # Runs after restore
-    def wake_after_restore(self):
-        # Wake up the server
+        # Start vLLM and warm it up
         ...
 ```
-
-### vLLM Sleep Mode
-
-The app uses vLLM's sleep mode to prepare for snapshotting:
-
-```bash
-vllm serve ... --enable-sleep-mode
-```
-
-When sleeping:
-- Model weights offloaded to CPU memory
-- KV cache emptied
-- Ready for memory snapshot
 
 ### Invalidating Snapshots
 
@@ -152,6 +140,8 @@ gpu="A10G"
 gpu="L4"
 ```
 
+The app will automatically enable the vLLM **v1** engine (`VLLM_USE_V1=1`) on Ampere+ GPUs (Compute Capability >= 8.0), and leave it unset on older GPUs like T4/V100.
+
 ### Sampling Parameters (Qwen3 Defaults)
 
 ```python
@@ -194,7 +184,7 @@ The first few requests after deployment create GPU snapshots. This is expected. 
 
 ### "Model not found" Error
 
-Ensure the model is accessible:
+Ensure the model is accessible (and that the container has a HuggingFace token if the repo is private):
 ```bash
 # Test model access
 python -c "from huggingface_hub import snapshot_download; snapshot_download('amazingvince/chess_qwen3_4b_reasoning_v2')"
@@ -206,6 +196,20 @@ python -c "from huggingface_hub import snapshot_download; snapshot_download('ama
 2. Check that `enable_memory_snapshot=True` is set
 3. Try changing `SNAPSHOT_VERSION` to force new snapshot
 
+### Snapshot restore fails with 9p "no such file or directory"
+
+If you see errors like `vfs.CompleteRestore() failed ... filesystem type "9p" ... no such file or directory`, it usually means vLLM/Torch wrote new cache files into a mounted Modal Volume during warmup (e.g. `torch_compile_cache`) but those writes weren't committed before snapshotting.
+
+- Fix: deploy the latest `UI/chess_app.py` (it commits the cache Volumes before snapshot) and bump `CHESS_SNAPSHOT_VERSION` to force a fresh snapshot.
+
+### Slow First Deploy / Build
+
+First deploys can take a while to download the model and compile kernels.
+
+- Increase Modal container timeout: `export CHESS_CONTAINER_TIMEOUT_MINUTES=45`
+- Increase vLLM startup wait: `export CHESS_VLLM_STARTUP_TIMEOUT_SECONDS=1800`
+- Increase snapshot-restore wait (wake-up): `export CHESS_VLLM_RESTORE_TIMEOUT_SECONDS=600`
+
 ### vLLM Startup Timeout
 
 If the model takes too long to load:
@@ -213,11 +217,26 @@ If the model takes too long to load:
 timeout=15 * MINUTES  # Increase timeout
 ```
 
+### `VLLM_USE_V1=1 is not supported with Compute Capability < 8.0`
+
+This happens if vLLM is forced into the v1 engine on an older GPU (e.g. T4).
+
+- Fix: use an Ampere+ GPU (`CHESS_GPU="A10G"` or `CHESS_GPU="L4"`), or unset it via `CHESS_VLLM_USE_V1=0`.
+
+### NCCL `TCPStore` "Broken pipe" warnings after snapshot restore
+
+If you see repeated warnings like `TCPStore.cpp:106 ... Broken pipe` after `Restoring Function from memory snapshot`, disable NCCL heartbeat monitoring:
+
+```bash
+export TORCH_NCCL_ENABLE_MONITORING=0
+```
+
+`UI/chess_app.py` sets this for the vLLM subprocess by default; if you still see the warnings, redeploy and bump `CHESS_SNAPSHOT_VERSION` to force a fresh snapshot.
+
 ## 📚 References
 
 - [Modal GPU Snapshots Documentation](https://modal.com/docs/examples/gpu_snapshot)
 - [Modal vLLM Example](https://modal.com/docs/examples/vllm_inference)
-- [vLLM Sleep Mode](https://docs.vllm.ai/en/stable/features/sleep_mode/)
 - [Ministral 3 Snapshot Example](https://modal.com/docs/examples/ministral3_inference)
 
 ## 📄 License
