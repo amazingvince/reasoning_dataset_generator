@@ -589,54 +589,58 @@ def create_dataset(config: ChessGRPOConfig, seed: int = 42) -> Dataset:
 
 
 # ============================================================================
-# Prompt Formatting (Chat format per TRL 2025 recommendations)
+# Prompt Formatting (Must match SFT format exactly!)
 # ============================================================================
 
-CHESS_SYSTEM_CONTENT = """You are an expert chess player. Analyze the position and choose the best move.
+# This prompt format MUST match what was used in SFT training (sft/train.py)
+# Key differences from standard chat:
+# - NO system message (everything in user content)
+# - Custom chat template adds <think> at generation prompt
+
+CHESS_PROMPT_TEMPLATE = """You are an expert chess player. Choose the best move.
+FEN: {fen}
+Legal moves (UCI): {legal_moves}
+
 Rules:
 - Put all reasoning inside <think>...</think>.
 - Output exactly one <uci_move>...</uci_move> tag with a single move copied from the legal moves list (no spaces).
 - Do not output anything after the closing </uci_move>.
 - Do not output "resign".
+
 Output format:
 <think>...</think>
-<uci_move>...</uci_move>"""
-
-CHESS_USER_TEMPLATE = """FEN: {fen}
-Legal moves (UCI): {legal_moves}
-
-Choose the best move."""
+<uci_move>...</uci_move>
+"""
 
 
 def format_chess_prompt(fen: str) -> list[dict[str, str]]:
     """Format a FEN into chat format for GRPO training.
 
-    Returns a list of message dicts per TRL conversational format.
+    Returns a list of message dicts matching SFT format (user message only, no system).
     """
     try:
         board = chess.Board(fen)
-        legal_moves = " ".join(sorted([m.uci() for m in board.legal_moves]))
+        legal_moves = ", ".join(sorted([m.uci() for m in board.legal_moves]))
     except ValueError:
         # Invalid FEN - return empty legal moves
         legal_moves = ""
 
+    # NO system message - must match SFT training format
     return [
-        {"role": "system", "content": CHESS_SYSTEM_CONTENT},
-        {"role": "user", "content": CHESS_USER_TEMPLATE.format(fen=fen, legal_moves=legal_moves)},
+        {"role": "user", "content": CHESS_PROMPT_TEMPLATE.format(fen=fen, legal_moves=legal_moves)},
     ]
 
 
 def format_chess_prompt_string(fen: str) -> str:
-    """Legacy string format for backward compatibility and FEN extraction in rewards."""
+    """String format for FEN extraction in rewards."""
     try:
         board = chess.Board(fen)
-        legal_moves = " ".join(sorted([m.uci() for m in board.legal_moves]))
+        legal_moves = ", ".join(sorted([m.uci() for m in board.legal_moves]))
     except ValueError:
         # Invalid FEN - return empty legal moves
         legal_moves = ""
 
-    return f"""FEN: {fen}
-Legal moves (UCI): {legal_moves}"""
+    return CHESS_PROMPT_TEMPLATE.format(fen=fen, legal_moves=legal_moves)
 
 
 def extract_uci_move(text: str) -> Optional[str]:
@@ -986,6 +990,33 @@ def main(config: Optional[ChessGRPOConfig] = None):
         model_kwargs["max_lora_rank"] = config.lora_r
 
     model, tokenizer = FastLanguageModel.from_pretrained(**model_kwargs)
+
+    # ========================================================================
+    # Setup Tokenizer (must match SFT training!)
+    # ========================================================================
+    # Custom chat template from SFT - adds <think> at generation prompt
+    CHAT_TEMPLATE = """\
+{%- for message in messages %}
+{%- if message['role'] == 'user' %}
+{{ message['content'] }}
+{%- elif message['role'] == 'assistant' %}
+{{ message['content'] }}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+<think>
+{%- endif %}
+"""
+    tokenizer.chat_template = CHAT_TEMPLATE
+    logger.info("Set custom chat template (matches SFT)")
+
+    # Add special tokens if not present
+    special_tokens = ["<uci_move>", "</uci_move>"]
+    tokens_to_add = [t for t in special_tokens if t not in tokenizer.get_vocab()]
+    if tokens_to_add:
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
+        model.resize_token_embeddings(len(tokenizer))
+        logger.info(f"Added special tokens: {tokens_to_add}")
 
     # ========================================================================
     # Apply LoRA or Enable Full Fine-tuning
