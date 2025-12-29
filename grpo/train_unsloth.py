@@ -1025,6 +1025,27 @@ def main(config: Optional[ChessGRPOConfig] = None):
         logger.info(f"Added special tokens: {tokens_to_add}")
 
     # ========================================================================
+    # CRITICAL: Patch tokenizer to preserve special tokens in completions
+    # ========================================================================
+    # TRL's GRPOTrainer hardcodes skip_special_tokens=True in batch_decode,
+    # which strips our <uci_move> tokens before they reach the reward function.
+    # See: https://github.com/huggingface/trl/issues/2897
+    original_batch_decode = tokenizer.batch_decode
+    def patched_batch_decode(*args, **kwargs):
+        # Force skip_special_tokens=False to preserve <uci_move> tags
+        kwargs["skip_special_tokens"] = False
+        return original_batch_decode(*args, **kwargs)
+    tokenizer.batch_decode = patched_batch_decode
+
+    original_decode = tokenizer.decode
+    def patched_decode(*args, **kwargs):
+        kwargs["skip_special_tokens"] = False
+        return original_decode(*args, **kwargs)
+    tokenizer.decode = patched_decode
+
+    logger.info("Patched tokenizer to preserve special tokens (fixes TRL issue #2897)")
+
+    # ========================================================================
     # Apply LoRA or Enable Full Fine-tuning
     # ========================================================================
     if config.use_lora:
