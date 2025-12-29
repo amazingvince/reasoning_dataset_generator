@@ -8,18 +8,25 @@ model:
 
 # Unsloth Configuration
 unsloth:
+  # LoRA mode (set to false for full fine-tuning)
+  use_lora: true
+
   # 16-bit LoRA recommended for H100 (plenty of VRAM)
   # Set to true for smaller GPUs
   load_in_4bit: false
-  
-  # FP8 training - 1.4x faster on H100, ~60% less model memory
+
+  # FP8 training - 1.4x faster on H100, ~50% less model memory
   # Requires H100/H200/A100/RTX 40xx
   use_fp8: false  # Set true for maximum speed
-  
+
+  # Gradient checkpointing - essential for long sequences
+  # "unsloth" mode is 30% faster than standard checkpointing
+  use_gradient_checkpointing: true
+
   # vLLM memory utilization - Unsloth Standby handles the rest
   # With UNSLOTH_VLLM_STANDBY=1, you can set this high
   gpu_memory_utilization: 0.85
-  
+
   # FP8 KV cache - 2x less KV cache memory on H100
   use_fp8_kv_cache: true
 
@@ -92,15 +99,35 @@ data:
 
 # GRPO Training Configuration - Optimized for H100
 training:
-  # Batch settings
-  # GRPO typically uses batch_size=1, relies on gradient accumulation
+  # =========================================================================
+  # Batch Size / Rollout Analysis for H100 80GB with LoRA
+  # =========================================================================
+  #
+  # Memory Budget (LoRA, BF16 base model, 2K completion):
+  #   Model weights (BF16):     ~8 GB (frozen, no optimizer states)
+  #   LoRA adapters (BF16):     ~0.5 GB (r=32, 7 modules)
+  #   AdamW states (FP32):      ~2 GB (only for LoRA params)
+  #   Gradients (BF16):         ~0.5 GB (only for LoRA params)
+  #   Activations (unsloth):    ~8-12 GB (2K seq, optimized checkpointing)
+  #   vLLM KV cache (FP8):      ~6-8 GB
+  #   GRPO logits (8 gens):     ~12-16 GB
+  #   ─────────────────────────────────
+  #   Total:                    ~40-50 GB (plenty of headroom on 80GB)
+  #
+  # Effective batch size = batch_size × grad_accum × num_generations
+  #   = 1 × 4 × 8 = 32 samples per optimizer step
+  #
+  # =========================================================================
+
+  # Batch settings - GRPO uses batch_size=1, gradient accumulation for stability
   per_device_train_batch_size: 1
   gradient_accumulation_steps: 4
-  
-  # GRPO specific - more generations = better advantage estimation
+
+  # GRPO rollouts - 8 generations for good advantage estimation
+  # More = better variance reduction, but diminishing returns past 8
   num_generations: 8
   max_prompt_length: 512
-  max_completion_length: 2048  # Your reasoning trace limit
+  max_completion_length: 2048  # Full reasoning trace length
   
   # Generation parameters
   temperature: 0.7
@@ -127,13 +154,14 @@ training:
   epsilon: 0.2
   epsilon_high: 0.28
 
-  # Optimizer - paged_adamw_8bit is memory efficient
+  # Optimizer - adamw_torch_fused is fastest on H100
+  # Alternatives: paged_adamw_8bit (memory efficient), adamw_torch (standard)
   # Note: DAPO paper uses learning_rate: 1.0e-6, but 5e-6 works well with LoRA
   learning_rate: 5.0e-6
   weight_decay: 0.1
   warmup_ratio: 0.1
   lr_scheduler_type: cosine
-  optim: paged_adamw_8bit
+  optim: adamw_torch_fused
   
   # Training duration
   # For GRPO, expect ~300+ steps to see reward improvement
@@ -154,26 +182,34 @@ training:
   # Output
   output_dir: "./chess_grpo_h100_output"
 
-# H100 Specific Notes:
-# ===================
-# 
-# Memory Budget (approximate for 4B model):
-# - Model weights (16-bit LoRA): ~8GB
-# - LoRA adapters: ~0.5GB
-# - Optimizer states: ~2GB (with paged_adamw_8bit)
-# - Gradients: ~8GB
-# - vLLM KV cache (with FP8): ~4GB per 2K context
-# - GRPO logits (8 generations): ~10GB (Unsloth optimizes this)
-# - Buffer: ~10GB
-# Total: ~45-50GB, leaving ~30GB headroom
+# Weights & Biases Configuration
+wandb:
+  enabled: true
+  project: "chess-grpo"
+  run_name: null  # Auto-generated if null
+  entity: null    # Your wandb team/user (optional)
+
+# =========================================================================
+# H100 Performance Notes (LoRA)
+# =========================================================================
 #
 # Throughput expectations:
-# - With vLLM: ~2000-4000 tokens/s generation
-# - Training step: ~5-15 seconds depending on completion length
-# - 50K samples * 1 epoch = ~5-15 hours
+# - vLLM generation: ~3000-5000 tokens/s
+# - Training step (8 generations, 2K completion): ~15-30 seconds
+# - 50K samples × 1 epoch ≈ 8-15 hours
 #
-# If you run out of memory:
-# 1. Reduce num_generations from 8 to 6 or 4
-# 2. Enable load_in_4bit: true
-# 3. Reduce max_completion_length
-# 4. Reduce gpu_memory_utilization to 0.7
+# =========================================================================
+# Troubleshooting OOM (unlikely with LoRA on H100)
+# =========================================================================
+#
+# Option 1: Reduce num_generations
+#   num_generations: 4    # Minimum viable for advantage estimation
+#
+# Option 2: Enable FP8 model weights
+#   use_fp8: true         # Saves ~4GB, 1.4x faster
+#
+# Option 3: Enable 4-bit quantization
+#   load_in_4bit: true    # Saves ~4GB, slight quality tradeoff
+#
+# Option 4: Lower vLLM memory
+#   gpu_memory_utilization: 0.7

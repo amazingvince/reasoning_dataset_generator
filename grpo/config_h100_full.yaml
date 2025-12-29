@@ -17,23 +17,21 @@ unsloth:
   # Full fine-tuning mode (no LoRA)
   use_lora: false
 
-  # 16-bit training (BF16 on H100)
+  # 16-bit base weights
   load_in_4bit: false
 
-  # FP8 training - RECOMMENDED for full fine-tuning
-  # Reduces model memory by ~50%, critical for fitting in 80GB
+  # FP8 training - REQUIRED for full fine-tuning with 2K completion
+  # Saves ~4GB model memory, critical for fitting in 80GB
   use_fp8: true
 
+  # Gradient checkpointing - REQUIRED for full fine-tuning
+  use_gradient_checkpointing: true
+
   # vLLM memory utilization - lower for full fine-tuning
-  # Full model + optimizer states need more reserved memory
   gpu_memory_utilization: 0.6
 
-  # FP8 KV cache - essential for memory savings
+  # FP8 KV cache - 2x less KV cache memory
   use_fp8_kv_cache: true
-
-  # Gradient checkpointing - REQUIRED for full fine-tuning
-  # Trades compute for memory (~30% slower but huge VRAM savings)
-  use_gradient_checkpointing: true
 
 # Stockfish Configuration
 stockfish:
@@ -90,26 +88,46 @@ data:
 
 # GRPO Training Configuration - Full Fine-Tuning
 training:
-  # Batch settings - smaller for full fine-tuning due to memory
-  per_device_train_batch_size: 1
-  gradient_accumulation_steps: 8  # Increased to compensate for fewer generations
+  # =========================================================================
+  # Batch Size / Rollout Analysis for H100 80GB - Full Fine-Tuning
+  # =========================================================================
+  #
+  # Memory Budget (FP8 model + FP32 optimizer, 2K completion):
+  #   Model weights (FP8):      ~4 GB
+  #   AdamW states (FP32):      ~32 GB (2 moments × 4B params × 4 bytes)
+  #   Gradients (BF16):         ~8 GB
+  #   Activations (checkpt):    ~12-16 GB (2K sequence)
+  #   GRPO logits storage:      ~4 GB per generation
+  #   vLLM KV cache (FP8):      ~6-8 GB
+  #   ─────────────────────────────────
+  #   With 2 generations:       ~70-76 GB ✓
+  #   With 4 generations:       ~78-84 GB ✗ (OOM risk)
+  #
+  # Effective batch size = batch_size × grad_accum × num_generations
+  #   = 1 × 16 × 2 = 32 samples per optimizer step
+  #
+  # =========================================================================
 
-  # GRPO specific - REDUCED for memory (4 instead of 8)
-  # Each generation stores full model activations
-  num_generations: 4
+  # Batch settings
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16   # Higher to compensate for 2 generations
+
+  # GRPO rollouts - 2 is minimum viable for full fine-tuning with 2K completion
+  # Gradient accumulation compensates for fewer generations
+  num_generations: 2
   max_prompt_length: 512
-  max_completion_length: 1024  # Reduced from 2048 for memory
+  max_completion_length: 2048       # Full reasoning trace
 
   # Generation parameters
   temperature: 0.7
 
-  # KL penalty - 0.0 per 2025 research
+  # KL penalty - 0.0 per 2025 research (verifiable rewards don't need KL)
   beta: 0.0
 
-  # Reward scaling
+  # Reward scaling - batch-level is more robust than per-prompt
   scale_rewards: "batch"
 
-  # Ignore truncated outputs
+  # Ignore truncated outputs in loss
   mask_truncated_completions: true
 
   # DAPO Loss Configuration (2025 best practice)
@@ -117,27 +135,31 @@ training:
   epsilon: 0.2
   epsilon_high: 0.28
 
-  # Optimizer - LOWER learning rate for full fine-tuning
-  # Full fine-tuning is more sensitive to LR than LoRA
-  learning_rate: 1.0e-6  # 5x lower than LoRA
-  weight_decay: 0.01     # Lower weight decay for full fine-tuning
+  # =========================================================================
+  # Optimizer - Full Fine-Tuning Settings
+  # =========================================================================
+  # adamw_torch_fused: PyTorch's fused CUDA kernel, ~20% faster than standard
+  # Requires PyTorch 2.0+ with CUDA. Falls back to adamw_torch if unavailable.
+  #
+  # Learning rate: 5x lower than LoRA since we're updating all parameters
+  # Weight decay: Lower to prevent over-regularization of base weights
+  # =========================================================================
+  optim: adamw_torch_fused
+  learning_rate: 1.0e-6
+  weight_decay: 0.01
   warmup_ratio: 0.1
   lr_scheduler_type: cosine
-
-  # Use regular AdamW (not 8-bit) for full fine-tuning stability
-  # 8-bit optimizers can cause issues with full model updates
-  optim: adamw_torch
 
   # Training duration
   num_train_epochs: 1
   max_steps: -1
 
-  # Gradient clipping - slightly higher for full fine-tuning
+  # Gradient clipping - slightly higher for full fine-tuning stability
   max_grad_norm: 0.5
 
   # Logging
   logging_steps: 1
-  save_steps: 250  # Save more frequently (full checkpoints are larger)
+  save_steps: 250  # More frequent saves (full checkpoints are ~16GB)
 
   # vLLM integration
   use_vllm: true
@@ -145,50 +167,51 @@ training:
   # Output
   output_dir: "./chess_grpo_h100_full_output"
 
-# Memory Budget (4B Model - Full Fine-Tuning with FP8)
-# =====================================================
-#
-# Component                          | Memory
-# -----------------------------------|--------
-# Model weights (FP8)                | ~4 GB
-# Optimizer states (AdamW, FP32)     | ~16 GB  (4x model params for Adam)
-# Gradients (BF16)                   | ~8 GB
-# Activations (with checkpointing)   | ~8 GB
-# vLLM KV cache (FP8, 1K ctx)        | ~2 GB
-# GRPO logits (4 generations)        | ~6 GB
-# Buffer                             | ~10 GB
-# -----------------------------------|--------
-# Total                              | ~54-60 GB
-#
-# This leaves ~20GB headroom on 80GB H100.
-#
-# WITHOUT FP8 (BF16 model):
-# - Model weights: ~8 GB (doubles)
-# - Would be very tight, may OOM with 4 generations
-#
-# For larger models (7B+):
-# - Use DeepSpeed ZeRO-3 or FSDP
-# - Or switch to LoRA (config_h100.yaml)
-#
-# Throughput expectations:
-# - Full fine-tuning is ~2-3x slower than LoRA
-# - Training step: ~15-30 seconds
-# - 50K samples * 1 epoch = ~20-40 hours
+# Weights & Biases Configuration
+wandb:
+  enabled: true
+  project: "chess-grpo"
+  run_name: null  # Auto-generated if null
+  entity: null    # Your wandb team/user (optional)
 
-# Troubleshooting Full Fine-Tuning OOM
-# =====================================
+# =========================================================================
+# Memory Budget (4B Model - Full Fine-Tuning, 2K Completion)
+# =========================================================================
 #
-# Option 1: Reduce generations (biggest impact)
-#   num_generations: 2
+# Default config (FP8 model, 2 generations, 2K completion):
+# ─────────────────────────────────────────────────────────────────────────
+# Component                          | Memory    | Notes
+# -----------------------------------|-----------|---------------------------
+# Model weights (FP8)                | ~4 GB     | 4B × 1 byte
+# AdamW optimizer states (FP32)      | ~32 GB    | 4B × 4 bytes × 2 moments
+# Gradients (BF16)                   | ~8 GB     | 4B × 2 bytes
+# Activations (gradient checkpt)     | ~12-16 GB | 2K sequence length
+# vLLM KV cache (FP8, 2K ctx)        | ~6-8 GB   |
+# GRPO logits (2 generations)        | ~8 GB     |
+# Buffer/fragmentation               | ~4 GB     |
+# ─────────────────────────────────────────────────────────────────────────
+# Total                              | ~74-80 GB | Fits on H100 80GB
 #
-# Option 2: Reduce completion length
-#   max_completion_length: 512
+# =========================================================================
+# Throughput Expectations
+# =========================================================================
+# - Full fine-tuning is ~2-3x slower than LoRA per step
+# - vLLM generation: ~2000-4000 tokens/s
+# - Training step (2 generations, 2K completion): ~30-60 seconds
+# - 50K samples × 1 epoch ≈ 20-40 hours
 #
-# Option 3: Lower GPU utilization for vLLM
+# =========================================================================
+# Troubleshooting OOM
+# =========================================================================
+#
+# Option 1: Lower GPU utilization for vLLM
 #   gpu_memory_utilization: 0.5
 #
-# Option 4: Use 4-bit quantization (quality tradeoff)
+# Option 2: Reduce completion length
+#   max_completion_length: 1024   # Significant memory savings
+#
+# Option 3: Use 4-bit quantization (quality tradeoff)
 #   load_in_4bit: true
 #
-# Option 5: Switch to LoRA (recommended for most cases)
-#   Use config_h100.yaml instead
+# Option 4: Switch to LoRA (recommended)
+#   Use config_h100.yaml instead - 3x faster, much more memory headroom

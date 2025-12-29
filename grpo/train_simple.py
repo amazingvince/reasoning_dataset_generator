@@ -20,6 +20,7 @@ os.environ["UNSLOTH_VLLM_STANDBY"] = "1"
 
 import chess
 import chess.engine
+import wandb
 from datasets import Dataset
 from unsloth import FastLanguageModel, is_bfloat16_supported
 from trl import GRPOConfig, GRPOTrainer
@@ -39,6 +40,10 @@ NUM_SAMPLES = 10000  # Start small for testing
 NUM_GENERATIONS = 8
 MAX_COMPLETION_LENGTH = 2048
 LEARNING_RATE = 5e-6
+
+# Wandb settings
+USE_WANDB = True
+WANDB_PROJECT = "chess-grpo"
 
 
 # ============================================================================
@@ -237,11 +242,14 @@ def create_simple_dataset(num_samples: int = 1000) -> Dataset:
 
 def main():
     import argparse
-    
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL_NAME)
     parser.add_argument("--samples", type=int, default=NUM_SAMPLES)
     parser.add_argument("--use_fp8", action="store_true", help="Use FP8 for H100")
+    parser.add_argument("--wandb", action="store_true", default=USE_WANDB, help="Enable wandb logging")
+    parser.add_argument("--no-wandb", dest="wandb", action="store_false", help="Disable wandb logging")
+    parser.add_argument("--wandb-project", default=WANDB_PROJECT, help="Wandb project name")
     args = parser.parse_args()
     
     print("=" * 60)
@@ -309,8 +317,27 @@ def main():
         max_grad_norm=0.1,
         bf16=is_bfloat16_supported(),
         use_vllm=True,
-        report_to=["tensorboard"],
+        report_to=["wandb", "tensorboard"] if args.wandb else ["tensorboard"],
     )
+
+    # Initialize wandb
+    if args.wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=f"chess-grpo-{args.model.split('/')[-1]}",
+            config={
+                "model_name": args.model,
+                "num_samples": args.samples,
+                "num_generations": NUM_GENERATIONS,
+                "max_completion_length": MAX_COMPLETION_LENGTH,
+                "learning_rate": LEARNING_RATE,
+                "use_fp8": args.use_fp8,
+                "loss_type": "dapo",
+                "beta": 0.0,
+            },
+            reinit=True,
+        )
+        print(f"Wandb initialized: {wandb.run.name}")
     
     # Create trainer
     trainer = GRPOTrainer(
@@ -338,15 +365,17 @@ def main():
     
     try:
         trainer.train()
-        
+
         # Save
         print("\nSaving model...")
         model.save_lora(f"{OUTPUT_DIR}/lora_weights")
         print(f"Done! Model saved to {OUTPUT_DIR}")
-        
+
     finally:
         if STOCKFISH_ENGINE:
             STOCKFISH_ENGINE.quit()
+        if args.wandb and wandb.run:
+            wandb.finish()
 
 
 if __name__ == "__main__":

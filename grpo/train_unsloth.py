@@ -26,6 +26,7 @@ from typing import Dict, Any, List, Optional, Iterator
 from dataclasses import dataclass, field
 
 import yaml
+import wandb
 
 # Enable Unsloth's memory-efficient vLLM standby mode BEFORE imports
 os.environ["UNSLOTH_VLLM_STANDBY"] = "1"
@@ -59,10 +60,14 @@ class ChessGRPOConfig:
     max_seq_length: int = 4096  # Prompt + completion
     
     # Unsloth settings
-    load_in_4bit: bool = False  # Use 16-bit LoRA for H100 (plenty of VRAM)
+    load_in_4bit: bool = False  # Use 16-bit for H100 (plenty of VRAM)
     use_fp8: bool = False  # Set True for FP8 training (1.4x faster on H100)
-    
-    # LoRA settings
+
+    # LoRA vs Full Fine-tuning
+    use_lora: bool = True  # Set False for full fine-tuning
+    use_gradient_checkpointing: bool = True  # Required for full fine-tuning
+
+    # LoRA settings (ignored if use_lora=False)
     lora_r: int = 32  # Larger rank for better learning
     lora_alpha: int = 32
     lora_dropout: float = 0.0  # 0 is optimized in Unsloth
@@ -119,7 +124,9 @@ class ChessGRPOConfig:
     weight_decay: float = 0.1
     warmup_ratio: float = 0.1
     lr_scheduler_type: str = "cosine"
-    optim: str = "paged_adamw_8bit"
+    # adamw_torch_fused: PyTorch fused AdamW kernel, fastest on H100
+    # paged_adamw_8bit: memory efficient for LoRA, but slower
+    optim: str = "adamw_torch_fused"
     
     # Training duration
     num_train_epochs: int = 1
@@ -148,7 +155,13 @@ class ChessGRPOConfig:
     logging_steps: int = 1
     save_steps: int = 500
     max_grad_norm: float = 0.1
-    
+
+    # Wandb logging
+    use_wandb: bool = True
+    wandb_project: str = "chess-grpo"
+    wandb_run_name: Optional[str] = None
+    wandb_entity: Optional[str] = None
+
     # Output
     output_dir: str = "./chess_grpo_h100_output"
     
@@ -205,6 +218,10 @@ class ChessGRPOConfig:
             config.load_in_4bit = as_bool(unsloth_cfg["load_in_4bit"], config.load_in_4bit)
         if "use_fp8" in unsloth_cfg:
             config.use_fp8 = as_bool(unsloth_cfg["use_fp8"], config.use_fp8)
+        if "use_lora" in unsloth_cfg:
+            config.use_lora = as_bool(unsloth_cfg["use_lora"], config.use_lora)
+        if "use_gradient_checkpointing" in unsloth_cfg:
+            config.use_gradient_checkpointing = as_bool(unsloth_cfg["use_gradient_checkpointing"], config.use_gradient_checkpointing)
         if "gpu_memory_utilization" in unsloth_cfg:
             config.gpu_memory_utilization = as_float(unsloth_cfg["gpu_memory_utilization"], config.gpu_memory_utilization)
         if "use_fp8_kv_cache" in unsloth_cfg:
@@ -334,6 +351,16 @@ class ChessGRPOConfig:
             config.use_vllm = as_bool(training["use_vllm"], config.use_vllm)
         if "output_dir" in training:
             config.output_dir = str(training["output_dir"])
+
+        wandb_cfg = section("wandb")
+        if "enabled" in wandb_cfg:
+            config.use_wandb = as_bool(wandb_cfg["enabled"], config.use_wandb)
+        if "project" in wandb_cfg:
+            config.wandb_project = str(wandb_cfg["project"])
+        if "run_name" in wandb_cfg:
+            config.wandb_run_name = str(wandb_cfg["run_name"]) if wandb_cfg["run_name"] else None
+        if "entity" in wandb_cfg:
+            config.wandb_entity = str(wandb_cfg["entity"]) if wandb_cfg["entity"] else None
 
         return config
 
@@ -917,34 +944,51 @@ def main(config: Optional[ChessGRPOConfig] = None):
     # Load Model with Unsloth
     # ========================================================================
     logger.info(f"Loading model: {config.model_name}")
+    logger.info(f"Mode: {'LoRA' if config.use_lora else 'Full Fine-tuning'}")
     logger.info(f"Using Unsloth with vLLM fast inference")
-    
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=config.model_name,
-        max_seq_length=config.max_seq_length,
-        load_in_4bit=config.load_in_4bit,
-        load_in_fp8=config.use_fp8,  # FP8 for H100 (1.4x faster)
-        fast_inference=config.use_vllm,  # Enable vLLM
-        max_lora_rank=config.lora_r,
-        gpu_memory_utilization=config.gpu_memory_utilization,
-        float8_kv_cache=config.use_fp8_kv_cache,  # 2x less KV cache on H100
-    )
-    
+
+    # Build model loading kwargs
+    model_kwargs = {
+        "model_name": config.model_name,
+        "max_seq_length": config.max_seq_length,
+        "load_in_4bit": config.load_in_4bit,
+        "load_in_fp8": config.use_fp8,
+        "fast_inference": config.use_vllm,
+        "gpu_memory_utilization": config.gpu_memory_utilization,
+        "float8_kv_cache": config.use_fp8_kv_cache,
+    }
+    # Only set max_lora_rank when using LoRA
+    if config.use_lora:
+        model_kwargs["max_lora_rank"] = config.lora_r
+
+    model, tokenizer = FastLanguageModel.from_pretrained(**model_kwargs)
+
     # ========================================================================
-    # Apply LoRA with Unsloth
+    # Apply LoRA or Enable Full Fine-tuning
     # ========================================================================
-    logger.info("Applying LoRA configuration...")
-    
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=config.lora_r,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        target_modules=list(config.lora_target_modules),
-        use_gradient_checkpointing="unsloth",  # 30% less VRAM, long context support
-        random_state=42,
-        max_seq_length=config.max_seq_length,
-    )
+    if config.use_lora:
+        logger.info("Applying LoRA configuration...")
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            target_modules=list(config.lora_target_modules),
+            use_gradient_checkpointing="unsloth" if config.use_gradient_checkpointing else False,
+            random_state=42,
+            max_seq_length=config.max_seq_length,
+        )
+    else:
+        logger.info("Full fine-tuning mode (no LoRA)")
+        # For full fine-tuning, we need gradient checkpointing to fit in memory
+        if config.use_gradient_checkpointing:
+            logger.info("Enabling gradient checkpointing for full fine-tuning...")
+            model.gradient_checkpointing_enable()
+        # Ensure all parameters are trainable
+        for param in model.parameters():
+            param.requires_grad = True
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Trainable parameters: {trainable_params:,}")
     
     # ========================================================================
     # Create Dataset
@@ -1019,8 +1063,39 @@ def main(config: Optional[ChessGRPOConfig] = None):
         
         # Misc
         remove_unused_columns=False,
-        report_to=["tensorboard"],
+        report_to=["wandb", "tensorboard"] if config.use_wandb else ["tensorboard"],
     )
+
+    # ========================================================================
+    # Initialize Wandb
+    # ========================================================================
+    if config.use_wandb:
+        wandb.init(
+            project=config.wandb_project,
+            name=config.wandb_run_name or f"chess-grpo-{config.model_name.split('/')[-1]}",
+            entity=config.wandb_entity,
+            config={
+                "model_name": config.model_name,
+                "max_seq_length": config.max_seq_length,
+                "lora_r": config.lora_r,
+                "lora_alpha": config.lora_alpha,
+                "learning_rate": config.learning_rate,
+                "num_generations": config.num_generations,
+                "max_completion_length": config.max_completion_length,
+                "temperature": config.temperature,
+                "beta": config.beta,
+                "loss_type": config.loss_type,
+                "epsilon": config.epsilon,
+                "epsilon_high": config.epsilon_high,
+                "num_train_samples": config.num_train_samples,
+                "stockfish_depth": config.stockfish_depth,
+                "reward_top1": config.reward_top1,
+                "reward_top3": config.reward_top3,
+                "reward_top5": config.reward_top5,
+            },
+            reinit=True,
+        )
+        logger.info(f"Wandb initialized: {wandb.run.name}")
     
     # ========================================================================
     # Initialize Trainer
@@ -1045,25 +1120,47 @@ def main(config: Optional[ChessGRPOConfig] = None):
     
     try:
         trainer.train()
-        
+
         # Log final stats
         reward_funcs[0].log_stats()
-        
+
+        # Log final stats to wandb
+        if config.use_wandb and wandb.run:
+            stats = reward_funcs[0].stockfish.stats
+            total = stats["total"] if stats["total"] > 0 else 1
+            wandb.log({
+                "final/top1_rate": stats["top1"] / total,
+                "final/top3_rate": stats["top3"] / total,
+                "final/top5_rate": stats["top5"] / total,
+                "final/legal_rate": stats["legal"] / total,
+                "final/illegal_rate": stats["illegal"] / total,
+                "final/no_move_rate": stats["no_move"] / total,
+                "final/engine_restarts": stats["engine_restarts"],
+            })
+
         # Save model
         logger.info("Saving model...")
-        
-        # Save LoRA weights
-        model.save_lora(os.path.join(config.output_dir, "lora_weights"))
-        
-        # Optionally merge and save full model
-        # model.save_pretrained_merged(
-        #     os.path.join(config.output_dir, "merged_model"),
-        #     tokenizer,
-        #     save_method="merged_16bit",
-        # )
-        
+
+        if config.use_lora:
+            # Save LoRA weights
+            model.save_lora(os.path.join(config.output_dir, "lora_weights"))
+            logger.info(f"LoRA weights saved to {config.output_dir}/lora_weights")
+
+            # Optionally merge and save full model
+            # model.save_pretrained_merged(
+            #     os.path.join(config.output_dir, "merged_model"),
+            #     tokenizer,
+            #     save_method="merged_16bit",
+            # )
+        else:
+            # Save full model for full fine-tuning
+            save_path = os.path.join(config.output_dir, "model")
+            model.save_pretrained(save_path)
+            tokenizer.save_pretrained(save_path)
+            logger.info(f"Full model saved to {save_path}")
+
         logger.info(f"Training complete! Model saved to {config.output_dir}")
-        
+
     except KeyboardInterrupt:
         logger.info("Training interrupted")
     except Exception as e:
@@ -1071,6 +1168,8 @@ def main(config: Optional[ChessGRPOConfig] = None):
         raise
     finally:
         reward_funcs[0].close()
+        if config.use_wandb and wandb.run:
+            wandb.finish()
 
 
 if __name__ == "__main__":
@@ -1086,6 +1185,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-samples", "--num_samples", dest="num_samples", type=int, default=None)
     parser.add_argument("--num-generations", "--num_generations", dest="num_generations", type=int, default=None)
     parser.add_argument("--use-fp8", "--use_fp8", dest="use_fp8", action="store_true", help="Use FP8 for faster training")
+    parser.add_argument("--full-finetune", "--full_finetune", dest="full_finetune", action="store_true", help="Full fine-tuning (no LoRA)")
     parser.add_argument("--output-dir", "--output_dir", dest="output_dir", type=str, default=None)
     args = parser.parse_args()
 
@@ -1114,7 +1214,9 @@ if __name__ == "__main__":
         config.num_generations = args.num_generations
     if args.use_fp8:
         config.use_fp8 = True
+    if args.full_finetune:
+        config.use_lora = False
     if args.output_dir:
         config.output_dir = args.output_dir
-    
+
     main(config)
