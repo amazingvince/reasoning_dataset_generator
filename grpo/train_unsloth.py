@@ -731,7 +731,7 @@ class StockfishRewardEngine:
                 board = chess.Board(fen)
                 result = self.engine.analyse(
                     board,
-                    chess.engine.Limit(depth=self.config.stockfish_depth, time=5.0),
+                    chess.engine.Limit(depth=self.config.stockfish_depth),
                     multipv=n
                 )
                 if isinstance(result, dict):
