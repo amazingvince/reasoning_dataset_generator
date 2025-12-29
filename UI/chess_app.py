@@ -33,12 +33,12 @@ VLLM_PORT = 8000
 CONTAINER_TIMEOUT_MINUTES = int(os.environ.get("CHESS_CONTAINER_TIMEOUT_MINUTES", "30"))
 VLLM_STARTUP_TIMEOUT_SECONDS = int(os.environ.get("CHESS_VLLM_STARTUP_TIMEOUT_SECONDS", str(20 * MINUTES)))
 VLLM_RESTORE_TIMEOUT_SECONDS = int(os.environ.get("CHESS_VLLM_RESTORE_TIMEOUT_SECONDS", "300"))
-VLLM_MAX_MODEL_LEN = int(os.environ.get("CHESS_VLLM_MAX_MODEL_LEN", "4096"))
+VLLM_MAX_MODEL_LEN = int(os.environ.get("CHESS_VLLM_MAX_MODEL_LEN", "8192"))
 VLLM_MAX_NUM_SEQS = int(os.environ.get("CHESS_VLLM_MAX_NUM_SEQS", "4"))
 VLLM_MAX_NUM_BATCHED_TOKENS = int(
     os.environ.get("CHESS_VLLM_MAX_NUM_BATCHED_TOKENS", str(VLLM_MAX_MODEL_LEN))
 )
-VLLM_PROMPT_HEADROOM = int(os.environ.get("CHESS_VLLM_PROMPT_HEADROOM", "256"))
+VLLM_PROMPT_HEADROOM = int(os.environ.get("CHESS_VLLM_PROMPT_HEADROOM", "1024"))
 
 # Snapshot version - change this to invalidate cached snapshots
 SNAPSHOT_VERSION = os.environ.get("CHESS_SNAPSHOT_VERSION", "v1")
@@ -904,6 +904,7 @@ def get_chess_html() -> str:
     
     <script type="text/babel">
         const { useState, useEffect, useRef } = React;
+        const DEFAULT_STATUS = 'Configure your game and click "New Game"';
         
         const OPENINGS = {
             starting: { name: "Starting Position", description: "Standard starting position" },
@@ -922,7 +923,7 @@ def get_chess_html() -> str:
         
         function ChessGame() {
             const [gameActive, setGameActive] = useState(false);
-            const [status, setStatus] = useState('Configure your game and click "New Game"');
+            const [status, setStatus] = useState(DEFAULT_STATUS);
             const [isThinking, setIsThinking] = useState(false);
             const [isPlayerTurn, setIsPlayerTurn] = useState(true);
             const [fen, setFen] = useState('start');
@@ -936,6 +937,7 @@ def get_chess_html() -> str:
             const boardRef = useRef(null);
             const eventSourceRef = useRef(null);
             const moveListRef = useRef([]);
+            const llmRequestIdRef = useRef(0);
             
             const gameActiveRef = useRef(false);
             const isThinkingRef = useRef(false);
@@ -965,6 +967,59 @@ def get_chess_html() -> str:
                 const next = [...moveListRef.current, uciMove];
                 setMoveHistoryFromList(next);
             };
+
+            const closeStream = () => {
+                if (eventSourceRef.current) {
+                    try { eventSourceRef.current.close(); } catch {}
+                    eventSourceRef.current = null;
+                }
+            };
+
+            const bumpRequestId = () => {
+                llmRequestIdRef.current += 1;
+                return llmRequestIdRef.current;
+            };
+
+            const applyFen = (nextFen) => {
+                fenRef.current = nextFen;
+                setFen(nextFen);
+                boardRef.current?.position(nextFen);
+            };
+
+            const setGameActiveSync = (value) => {
+                gameActiveRef.current = value;
+                setGameActive(value);
+            };
+
+            const setThinkingSync = (value) => {
+                isThinkingRef.current = value;
+                setIsThinking(value);
+            };
+
+            const setPlayerTurnSync = (value) => {
+                isPlayerTurnRef.current = value;
+                setIsPlayerTurn(value);
+            };
+
+            const setPlayerColorSync = (value) => {
+                playerColorRef.current = value;
+                setPlayerColor(value);
+            };
+
+            const resetGameState = () => {
+                closeStream();
+                bumpRequestId();
+                setIsStreaming(false);
+                setThinkingSync(false);
+                setGameActiveSync(false);
+                setMoveHistoryFromList([]);
+                setReasoning('');
+                setGameOver(null);
+                applyFen('start');
+                setPlayerTurnSync(true);
+                setSelectedOpening('starting');
+                setStatus(DEFAULT_STATUS);
+            };
             
             useEffect(() => {
                 boardRef.current = Chessboard('board', {
@@ -977,8 +1032,7 @@ def get_chess_html() -> str:
                 const onResize = () => boardRef.current?.resize();
                 $(window).on('resize', onResize);
                 return () => {
-                    try { eventSourceRef.current?.close(); } catch {}
-                    eventSourceRef.current = null;
+                    closeStream();
                     $(window).off('resize', onResize);
                     boardRef.current?.destroy();
                 };
@@ -1010,57 +1064,57 @@ def get_chess_html() -> str:
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ fen: fenRef.current, move: uciMove, player_color: playerColorRef.current })
                     });
+                    if (!response.ok) throw new Error('Move request failed');
                     const data = await response.json();
                     if (data.success) {
-                        if (data.fen) {
-                            setFen(data.fen);
-                            boardRef.current.position(data.fen);
-                        } else {
-                            boardRef.current.position(fenRef.current);
-                        }
+                        if (data.fen) applyFen(data.fen);
+                        else boardRef.current?.position(fenRef.current);
                         
                         appendMove(uciMove);
                         if (data.game_over) setGameOver(data.game_over);
                         
                         if (data.game_over?.is_over) {
                             setStatus('Game Over!');
-                            setIsPlayerTurn(!!data.is_player_turn);
+                            setPlayerTurnSync(!!data.is_player_turn);
                         } else {
-                            setIsPlayerTurn(false);
-                            triggerLLMMove();
+                            setPlayerTurnSync(false);
+                            triggerLLMMove(data.fen || fenRef.current);
                         }
                     } else {
-                        boardRef.current.position(fenRef.current);
+                        setStatus(data.error || 'Invalid move');
+                        boardRef.current?.position(fenRef.current);
                     }
                 } catch {
-                    boardRef.current.position(fenRef.current);
+                    setStatus('Move failed - try again');
+                    boardRef.current?.position(fenRef.current);
                 }
             };
             
             const onSnapEnd = () => boardRef.current.position(fenRef.current);
             
-            const triggerLLMMove = async () => {
+            const triggerLLMMove = async (fenOverride = null) => {
                 if (!gameActiveRef.current) return;
-                const currentFen = fenRef.current;
+                const currentFen = fenOverride || fenRef.current;
                 const currentColor = playerColorRef.current;
                 
-                setIsThinking(true);
+                setPlayerTurnSync(false);
+                setThinkingSync(true);
                 setIsStreaming(true);
                 setStatus('LLM is thinking...');
                 setReasoning('');
                 
-                // Close any previous stream.
-                if (eventSourceRef.current) {
-                    try { eventSourceRef.current.close(); } catch {}
-                    eventSourceRef.current = null;
-                }
+                closeStream();
+                const requestId = bumpRequestId();
                 
                 try {
                     const es = new EventSource(`/api/llm-move?fen=${encodeURIComponent(currentFen)}&player_color=${encodeURIComponent(currentColor)}`);
                     eventSourceRef.current = es;
                     let fullText = '';
                     
+                    const isStale = () => requestId !== llmRequestIdRef.current;
+                    
                     es.addEventListener('chunk', e => {
+                        if (isStale()) return;
                         const d = JSON.parse(e.data);
                         fullText += d.text;
                         const m = fullText.match(/<think>([\s\S]*?)(<\/think>|$)/);
@@ -1068,74 +1122,78 @@ def get_chess_html() -> str:
                     });
                     
                     es.addEventListener('complete', e => {
+                        if (isStale()) return;
                         const d = JSON.parse(e.data);
                         try { es.close(); } catch {}
                         if (eventSourceRef.current === es) eventSourceRef.current = null;
                         
                         setIsStreaming(false);
-                        setIsThinking(false);
+                        setThinkingSync(false);
                         
                         if (d?.fen) {
-                            setFen(d.fen);
-                            boardRef.current.position(d.fen);
+                            applyFen(d.fen);
                         } else {
-                            boardRef.current.position(fenRef.current);
+                            boardRef.current?.position(fenRef.current);
                         }
                         
                         if (d?.move) appendMove(d.move);
                         if (d?.game_over) setGameOver(d.game_over);
-                        if (typeof d?.is_player_turn === 'boolean') setIsPlayerTurn(d.is_player_turn);
-                        if (d?.reasoning) setReasoning(d.reasoning);
+                        if (typeof d?.is_player_turn === 'boolean') setPlayerTurnSync(d.is_player_turn);
+                        if (typeof d?.reasoning === 'string') setReasoning(d.reasoning);
                         
                         if (d?.game_over?.is_over) setStatus('Game Over!');
                         else setStatus(`Your turn (${playerColorRef.current})`);
                     });
                     
                     es.addEventListener('error', () => {
+                        if (isStale()) return;
                         try { es.close(); } catch {}
                         if (eventSourceRef.current === es) eventSourceRef.current = null;
                         setIsStreaming(false);
-                        setIsThinking(false);
-                        setStatus('Error - try again');
-                        boardRef.current.position(fenRef.current);
+                        setThinkingSync(false);
+                        setPlayerTurnSync(true);
+                        setStatus('LLM error - your turn');
+                        boardRef.current?.position(fenRef.current);
                     });
                 } catch {
                     setIsStreaming(false);
-                    setIsThinking(false);
-                    setStatus('Error');
-                    boardRef.current.position(fenRef.current);
+                    setThinkingSync(false);
+                    setPlayerTurnSync(true);
+                    setStatus('LLM error - your turn');
+                    boardRef.current?.position(fenRef.current);
                 }
             };
             
             const startNewGame = async (resetOpening = false) => {
+                resetOpening = resetOpening === true;
                 // Stop any in-flight stream.
-                if (eventSourceRef.current) {
-                    try { eventSourceRef.current.close(); } catch {}
-                    eventSourceRef.current = null;
-                }
+                closeStream();
+                bumpRequestId();
                 setIsStreaming(false);
-                setIsThinking(true);
+                setThinkingSync(true);
                 setStatus('Starting new game...');
                 const openingToUse = resetOpening ? 'starting' : selectedOpening;
                 if (resetOpening && selectedOpening !== 'starting') setSelectedOpening('starting');
+                const chosenColor = playerColorRef.current;
                 try {
                     const r = await fetch('/api/new-game', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ player_color: playerColor, opening: openingToUse })
+                        body: JSON.stringify({ player_color: chosenColor, opening: openingToUse })
                     });
+                    if (!r.ok) throw new Error('New game request failed');
                     const d = await r.json();
-                    setGameActive(true);
+                    setGameActiveSync(true);
                     setMoveHistoryFromList(Array.isArray(d.move_history) ? d.move_history : []);
                     setReasoning('');
                     setGameOver(null);
-                    setFen(d.fen);
-                    boardRef.current.position(d.fen);
-                    boardRef.current.orientation(playerColor);
-                    setIsPlayerTurn(d.is_player_turn);
-                    setIsThinking(false);
-                    d.is_player_turn ? setStatus(`Your turn (${playerColor})`) : triggerLLMMove();
-                } catch { setIsThinking(false); setStatus('Error starting game'); }
+                    if (d.fen) applyFen(d.fen);
+                    else applyFen('start');
+                    boardRef.current?.orientation(chosenColor);
+                    setPlayerTurnSync(d.is_player_turn);
+                    setThinkingSync(false);
+                    d.is_player_turn ? setStatus(`Your turn (${chosenColor})`) : triggerLLMMove(d.fen || fenRef.current);
+                } catch { setThinkingSync(false); setStatus('Error starting game'); }
             };
             
             const getGameOverMessage = () => {
@@ -1159,8 +1217,8 @@ def get_chess_html() -> str:
                                 <div className="form-group">
                                     <label>Play as</label>
                                     <div className="color-toggle">
-                                        <button className={`color-btn ${playerColor==='white'?'active':''}`} onClick={()=>setPlayerColor('white')} disabled={gameActive}>♔ White</button>
-                                        <button className={`color-btn ${playerColor==='black'?'active':''}`} onClick={()=>setPlayerColor('black')} disabled={gameActive}>♚ Black</button>
+                                        <button className={`color-btn ${playerColor==='white'?'active':''}`} onClick={()=>setPlayerColorSync('white')} disabled={gameActive}>♔ White</button>
+                                        <button className={`color-btn ${playerColor==='black'?'active':''}`} onClick={()=>setPlayerColorSync('black')} disabled={gameActive}>♚ Black</button>
                                     </div>
                                 </div>
                                 <div className="form-group">
@@ -1187,8 +1245,8 @@ def get_chess_html() -> str:
                             </div>
                             <div id="board"></div>
                             <div className="controls">
-                                <button className="btn btn-primary" onClick={startNewGame} disabled={isThinking}>New Game</button>
-                                <button className="btn" onClick={()=>{try{eventSourceRef.current?.close();}catch{}eventSourceRef.current=null;setIsStreaming(false);setIsThinking(false);setGameActive(false);setMoveHistoryFromList([]);setReasoning('');setGameOver(null);setFen('start');setIsPlayerTurn(true);setSelectedOpening('starting');boardRef.current.position('start');setStatus('Configure and click "New Game"');}} disabled={isThinking}>Reset</button>
+                                <button className="btn btn-primary" onClick={() => startNewGame(false)} disabled={isThinking}>New Game</button>
+                                <button className="btn" onClick={resetGameState} disabled={isThinking}>Reset</button>
                             </div>
                         </div>
                         
