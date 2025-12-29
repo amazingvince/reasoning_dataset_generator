@@ -1,0 +1,194 @@
+# Chess GRPO Training Configuration - Full Fine-Tuning (No LoRA)
+# ==================================================================
+# Optimized for Single H100 80GB GPU
+#
+# WARNING: Full fine-tuning requires significantly more VRAM than LoRA.
+# This config is tuned for 4B models. For larger models, consider:
+# - Multi-GPU with DeepSpeed ZeRO-3 or FSDP
+# - Using LoRA instead (config_h100.yaml)
+
+# Model Configuration
+model:
+  name_or_path: "your-chess-model-4b"  # Replace with your model path
+  max_seq_length: 4096  # Prompt + completion total
+
+# Unsloth Configuration
+unsloth:
+  # Full fine-tuning mode (no LoRA)
+  use_lora: false
+
+  # 16-bit training (BF16 on H100)
+  load_in_4bit: false
+
+  # FP8 training - RECOMMENDED for full fine-tuning
+  # Reduces model memory by ~50%, critical for fitting in 80GB
+  use_fp8: true
+
+  # vLLM memory utilization - lower for full fine-tuning
+  # Full model + optimizer states need more reserved memory
+  gpu_memory_utilization: 0.6
+
+  # FP8 KV cache - essential for memory savings
+  use_fp8_kv_cache: true
+
+  # Gradient checkpointing - REQUIRED for full fine-tuning
+  # Trades compute for memory (~30% slower but huge VRAM savings)
+  use_gradient_checkpointing: true
+
+# Stockfish Configuration
+stockfish:
+  path: "/usr/games/stockfish"
+  depth: 20
+  threads: 8
+  hash_mb: 512
+
+# Reward Configuration
+# Rebalanced to emphasize move quality over format compliance
+reward:
+  # Stockfish match rewards (increased to dominate reward signal)
+  top1_reward: 1.5     # Matches Stockfish best move
+  top3_reward: 1.0     # In top 3 moves
+  top5_reward: 0.6     # In top 5 moves
+  legal_reward: 0.1    # Legal but not in top 5
+  illegal_penalty: -0.5
+  no_move_penalty: -1.0
+
+  # Format rewards (reduced to avoid masking move quality signal)
+  format_bonus: 0.1
+  format_penalty: -0.1
+  xml_bonus: 0.05
+  xml_penalty: -0.15
+
+# Data Configuration
+data:
+  # Game positions
+  games_dataset: "Lichess/standard-chess-games"
+  min_elo: 800
+  sample_rate: 0.3
+  skip_first_moves: 4
+  skip_last_moves: 2
+
+  # Puzzle positions
+  puzzles_dataset: "Lichess/chess-puzzles"
+  min_puzzle_rating: 800
+  max_puzzle_rating: 2500
+  puzzle_ratio: 0.3
+
+  # ELO weighting
+  elo_weights:
+    800: 0.08
+    1000: 0.10
+    1200: 0.12
+    1400: 0.15
+    1600: 0.18
+    1800: 0.20
+    2000: 0.18
+    2200: 0.12
+    2400: 0.08
+
+  num_train_samples: 50000
+
+# GRPO Training Configuration - Full Fine-Tuning
+training:
+  # Batch settings - smaller for full fine-tuning due to memory
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8  # Increased to compensate for fewer generations
+
+  # GRPO specific - REDUCED for memory (4 instead of 8)
+  # Each generation stores full model activations
+  num_generations: 4
+  max_prompt_length: 512
+  max_completion_length: 1024  # Reduced from 2048 for memory
+
+  # Generation parameters
+  temperature: 0.7
+
+  # KL penalty - 0.0 per 2025 research
+  beta: 0.0
+
+  # Reward scaling
+  scale_rewards: "batch"
+
+  # Ignore truncated outputs
+  mask_truncated_completions: true
+
+  # DAPO Loss Configuration (2025 best practice)
+  loss_type: "dapo"
+  epsilon: 0.2
+  epsilon_high: 0.28
+
+  # Optimizer - LOWER learning rate for full fine-tuning
+  # Full fine-tuning is more sensitive to LR than LoRA
+  learning_rate: 1.0e-6  # 5x lower than LoRA
+  weight_decay: 0.01     # Lower weight decay for full fine-tuning
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+
+  # Use regular AdamW (not 8-bit) for full fine-tuning stability
+  # 8-bit optimizers can cause issues with full model updates
+  optim: adamw_torch
+
+  # Training duration
+  num_train_epochs: 1
+  max_steps: -1
+
+  # Gradient clipping - slightly higher for full fine-tuning
+  max_grad_norm: 0.5
+
+  # Logging
+  logging_steps: 1
+  save_steps: 250  # Save more frequently (full checkpoints are larger)
+
+  # vLLM integration
+  use_vllm: true
+
+  # Output
+  output_dir: "./chess_grpo_h100_full_output"
+
+# Memory Budget (4B Model - Full Fine-Tuning with FP8)
+# =====================================================
+#
+# Component                          | Memory
+# -----------------------------------|--------
+# Model weights (FP8)                | ~4 GB
+# Optimizer states (AdamW, FP32)     | ~16 GB  (4x model params for Adam)
+# Gradients (BF16)                   | ~8 GB
+# Activations (with checkpointing)   | ~8 GB
+# vLLM KV cache (FP8, 1K ctx)        | ~2 GB
+# GRPO logits (4 generations)        | ~6 GB
+# Buffer                             | ~10 GB
+# -----------------------------------|--------
+# Total                              | ~54-60 GB
+#
+# This leaves ~20GB headroom on 80GB H100.
+#
+# WITHOUT FP8 (BF16 model):
+# - Model weights: ~8 GB (doubles)
+# - Would be very tight, may OOM with 4 generations
+#
+# For larger models (7B+):
+# - Use DeepSpeed ZeRO-3 or FSDP
+# - Or switch to LoRA (config_h100.yaml)
+#
+# Throughput expectations:
+# - Full fine-tuning is ~2-3x slower than LoRA
+# - Training step: ~15-30 seconds
+# - 50K samples * 1 epoch = ~20-40 hours
+
+# Troubleshooting Full Fine-Tuning OOM
+# =====================================
+#
+# Option 1: Reduce generations (biggest impact)
+#   num_generations: 2
+#
+# Option 2: Reduce completion length
+#   max_completion_length: 512
+#
+# Option 3: Lower GPU utilization for vLLM
+#   gpu_memory_utilization: 0.5
+#
+# Option 4: Use 4-bit quantization (quality tradeoff)
+#   load_in_4bit: true
+#
+# Option 5: Switch to LoRA (recommended for most cases)
+#   Use config_h100.yaml instead
