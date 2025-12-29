@@ -127,8 +127,8 @@ training:
   # GRPO rollouts - 8 generations for good advantage estimation
   # More = better variance reduction, but diminishing returns past 8
   num_generations: 8
-  max_prompt_length: 512
-  max_completion_length: 2048  # Full reasoning trace length
+  max_prompt_length: 1024   # Input tokens (FEN + legal moves + instructions)
+  max_completion_length: 2048  # Output tokens (thinking + move)
   
   # Generation parameters
   temperature: 0.7

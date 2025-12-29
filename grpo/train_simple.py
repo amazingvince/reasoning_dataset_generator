@@ -294,7 +294,7 @@ def main():
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         num_generations=NUM_GENERATIONS,
-        max_prompt_length=512,
+        max_prompt_length=1024,
         max_completion_length=MAX_COMPLETION_LENGTH,
         temperature=0.7,
         # 2025 best practices: beta=0 (no KL penalty with verifiable rewards)

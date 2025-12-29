@@ -116,8 +116,8 @@ class ChessGRPOConfig:
     per_device_train_batch_size: int = 1  # GRPO uses 1, gradient accumulation handles rest
     gradient_accumulation_steps: int = 4
     num_generations: int = 8  # More generations = better advantage estimation
-    max_prompt_length: int = 512
-    max_completion_length: int = 2048  # Your reasoning trace limit
+    max_prompt_length: int = 1024  # Input tokens (FEN + legal moves + instructions)
+    max_completion_length: int = 2048  # Output tokens (thinking + move)
     
     # Optimizer
     learning_rate: float = 5e-6
@@ -866,20 +866,25 @@ def create_reward_functions(config: ChessGRPOConfig):
             else:
                 text = str(completion)
 
-            # Debug: log first few completions to see what model is generating
+            # Debug: print first few completions to see what model is generating
             _debug_counter["count"] += 1
             if _debug_counter["count"] <= 5:
-                logger.info(f"[DEBUG] Completion type: {type(completion)}")
-                logger.info(f"[DEBUG] Completion sample ({len(text)} chars): {text[:500]}...")
-                if len(text) > 500:
-                    logger.info(f"[DEBUG] ...end: {text[-200:]}")
+                print(f"\n{'='*60}", flush=True)
+                print(f"[REWARD DEBUG {_debug_counter['count']}/5]", flush=True)
+                print(f"Completion type: {type(completion)}", flush=True)
+                print(f"Completion ({len(text)} chars):", flush=True)
+                print(text[:800], flush=True)
+                if len(text) > 800:
+                    print(f"... [truncated] ...", flush=True)
+                    print(text[-200:], flush=True)
 
             # Extract FEN from prompt (handles both string and chat format)
             prompt_text = _extract_prompt_text(prompt)
             fen_match = re.search(r'FEN:\s*([^\n]+)', prompt_text)
             if not fen_match:
                 if _debug_counter["count"] <= 5:
-                    logger.warning(f"[DEBUG] No FEN found in prompt: {prompt_text[:300]}...")
+                    print(f"[REWARD DEBUG] No FEN found in prompt!", flush=True)
+                    print(f"Prompt: {prompt_text[:300]}...", flush=True)
                 rewards.append(config.reward_no_move)
                 continue
 
@@ -887,8 +892,9 @@ def create_reward_functions(config: ChessGRPOConfig):
             predicted_move = extract_uci_move(text)
 
             if _debug_counter["count"] <= 5:
-                logger.info(f"[DEBUG] FEN: {fen}")
-                logger.info(f"[DEBUG] Extracted move: {predicted_move}")
+                print(f"FEN: {fen}", flush=True)
+                print(f"Extracted move: {predicted_move}", flush=True)
+                print(f"{'='*60}\n", flush=True)
 
             reward = stockfish.compute_single_reward(fen, predicted_move)
             rewards.append(reward)

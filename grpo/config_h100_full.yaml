@@ -115,8 +115,8 @@ training:
   # GRPO rollouts - 2 is minimum viable for full fine-tuning with 2K completion
   # Gradient accumulation compensates for fewer generations
   num_generations: 2
-  max_prompt_length: 512
-  max_completion_length: 2048       # Full reasoning trace
+  max_prompt_length: 1024           # Input tokens (FEN + legal moves + instructions)
+  max_completion_length: 2048       # Output tokens (thinking + move)
 
   # Generation parameters
   temperature: 0.7
