@@ -22,6 +22,7 @@ import math
 import random
 import logging
 import shutil
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Iterator
 from dataclasses import dataclass, field
@@ -139,6 +140,9 @@ class ChessGRPOConfig:
     # With verifiable rewards like Stockfish, KL penalty is unnecessary
     beta: float = 0.0
     temperature: float = 0.7
+    top_p: float = 1.0
+    top_k: int = 0
+    min_p: Optional[float] = None
     # scale_rewards="batch" is more robust than per-group normalization
     scale_rewards: str = "batch"
     # Ignore truncated outputs in loss computation
@@ -222,6 +226,28 @@ class ChessGRPOConfig:
             if value is None:
                 return default
             return bool(value)
+
+        def as_optional_float(value: Any, default: Optional[float]) -> Optional[float]:
+            if value is None:
+                return default
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def as_scale_rewards(value: Any, default: str) -> str:
+            if isinstance(value, bool):
+                return "group" if value else "none"
+            if value is None:
+                return default
+            text = str(value).strip().lower()
+            if text in {"none", "false", "0", "no"}:
+                return "none"
+            if text in {"group", "true", "1", "yes"}:
+                return "group"
+            if text == "batch":
+                return "batch"
+            return str(value)
 
         model = section("model")
         if "name_or_path" in model:
@@ -355,10 +381,16 @@ class ChessGRPOConfig:
             config.max_completion_length = as_int(training["max_completion_length"], config.max_completion_length)
         if "temperature" in training:
             config.temperature = as_float(training["temperature"], config.temperature)
+        if "top_p" in training:
+            config.top_p = as_float(training["top_p"], config.top_p)
+        if "top_k" in training:
+            config.top_k = as_int(training["top_k"], config.top_k)
+        if "min_p" in training:
+            config.min_p = as_optional_float(training["min_p"], config.min_p)
         if "beta" in training:
             config.beta = as_float(training["beta"], config.beta)
         if "scale_rewards" in training:
-            config.scale_rewards = str(training["scale_rewards"])
+            config.scale_rewards = as_scale_rewards(training["scale_rewards"], config.scale_rewards)
         if "mask_truncated_completions" in training:
             config.mask_truncated_completions = as_bool(training["mask_truncated_completions"], config.mask_truncated_completions)
         # DAPO loss configuration
@@ -652,6 +684,24 @@ Output format:
 <think>...</think>
 <uci_move>...</uci_move>
 """
+
+# Prefix added by chat template's add_generation_prompt (not included in TRL completions)
+# TRL's GRPO only returns the tokens the model generated, not the generation prompt prefix.
+# We must prepend this to completions before reward evaluation so regex matches work.
+GENERATION_PROMPT_PREFIX = "<think>\n"
+
+
+def _extract_completion_text(completion) -> str:
+    """Extract text from completion, prepending chat template prefix.
+
+    TRL's GRPO completions don't include the generation prompt prefix (<think>)
+    that the chat template adds. We prepend it here so reward regexes match.
+    """
+    if isinstance(completion, list):
+        text = completion[0].get("content", "") if completion else ""
+    else:
+        text = str(completion)
+    return GENERATION_PROMPT_PREFIX + text
 
 
 def format_chess_prompt(fen: str) -> list[dict[str, str]]:
@@ -1311,6 +1361,7 @@ def create_reward_functions(config: ChessGRPOConfig):
 
     # Debug counter for logging samples
     _debug_counter = {"count": 0}
+    _call_counter = {"count": 0}
 
     # Main move quality reward function (WPD or Top-N based on engine)
     def move_quality_reward_func(completions, prompts, **kwargs):
@@ -1342,11 +1393,10 @@ def create_reward_functions(config: ChessGRPOConfig):
                 engine.get_top_moves(fen)
 
         rewards = []
+        moves_by_fen: Dict[str, List[Optional[str]]] = defaultdict(list)
+        rewards_by_fen: Dict[str, List[float]] = defaultdict(list)
         for completion, prompt in zip(completions, prompts):
-            if isinstance(completion, list):
-                text = completion[0].get("content", "") if completion else ""
-            else:
-                text = str(completion)
+            text = _extract_completion_text(completion)
 
             _debug_counter["count"] += 1
             if _debug_counter["count"] <= 5:
@@ -1374,12 +1424,69 @@ def create_reward_functions(config: ChessGRPOConfig):
                 print(f"Extracted move: {predicted_move}", flush=True)
 
             reward = engine.compute_single_reward(fen, predicted_move)
+            moves_by_fen[fen].append(predicted_move)
+            rewards_by_fen[fen].append(reward)
 
             if _debug_counter["count"] <= 5:
                 print(f"Reward: {reward}", flush=True)
                 print(f"{'='*60}\n", flush=True)
 
             rewards.append(reward)
+
+        _call_counter["count"] += 1
+        if moves_by_fen and (_call_counter["count"] <= 5 or _call_counter["count"] % 50 == 0):
+            def stdev(values: List[float]) -> float:
+                n = len(values)
+                if n < 2:
+                    return 0.0
+                mean = sum(values) / n
+                var = sum((x - mean) ** 2 for x in values) / (n - 1)
+                return math.sqrt(var)
+
+            per_prompt_unique = []
+            per_prompt_mode_share = []
+            per_prompt_parse_rate = []
+            per_prompt_reward_std = []
+            per_prompt_size = []
+
+            for fen, moves in moves_by_fen.items():
+                group_rewards = rewards_by_fen.get(fen) or []
+                group_size = len(moves)
+                per_prompt_size.append(group_size)
+
+                parsed_moves = [m for m in moves if m]
+                parse_rate = len(parsed_moves) / group_size if group_size else 0.0
+                per_prompt_parse_rate.append(parse_rate)
+
+                unique_moves = len(set(parsed_moves))
+                per_prompt_unique.append(unique_moves)
+
+                if parsed_moves:
+                    most_common = Counter(parsed_moves).most_common(1)[0][1]
+                    per_prompt_mode_share.append(most_common / len(parsed_moves))
+                else:
+                    per_prompt_mode_share.append(1.0)
+
+                per_prompt_reward_std.append(stdev(group_rewards))
+
+            num_prompts = len(per_prompt_unique)
+            avg_unique = sum(per_prompt_unique) / num_prompts if num_prompts else 0.0
+            min_unique = min(per_prompt_unique) if per_prompt_unique else 0
+            avg_mode_share = sum(per_prompt_mode_share) / num_prompts if num_prompts else 1.0
+            avg_parse_rate = sum(per_prompt_parse_rate) / num_prompts if num_prompts else 0.0
+            avg_reward_std = sum(per_prompt_reward_std) / num_prompts if num_prompts else 0.0
+            zero_std_rate = sum(1 for s in per_prompt_reward_std if s < 1e-3) / num_prompts if num_prompts else 0.0
+            avg_group_size = sum(per_prompt_size) / num_prompts if num_prompts else 0.0
+
+            logger.info(
+                f"[{reward_name} Diversity] calls={_call_counter['count']}, "
+                f"prompts={num_prompts}, avg_group_size={avg_group_size:.1f}, "
+                f"avg_unique_moves={avg_unique:.2f} (min={min_unique}), "
+                f"avg_mode_share={avg_mode_share:.2f}, "
+                f"avg_parse_rate={avg_parse_rate:.1%}, "
+                f"avg_reward_std={avg_reward_std:.3f}, "
+                f"near_zero_std_prompts={zero_std_rate:.1%}"
+            )
 
         if _debug_counter["count"] <= 10:
             print(f"[{reward_name}] Completed {len(rewards)} rewards", flush=True)
@@ -1392,10 +1499,7 @@ def create_reward_functions(config: ChessGRPOConfig):
 
         rewards = []
         for completion in completions:
-            if isinstance(completion, list):
-                text = completion[0].get("content", "") if completion else ""
-            else:
-                text = str(completion)
+            text = _extract_completion_text(completion)
 
             if re.search(pattern, text, re.IGNORECASE):
                 rewards.append(config.reward_format_bonus)
@@ -1409,10 +1513,7 @@ def create_reward_functions(config: ChessGRPOConfig):
         """Reward for having exactly one of each XML tag."""
         rewards = []
         for completion in completions:
-            if isinstance(completion, list):
-                text = completion[0].get("content", "") if completion else ""
-            else:
-                text = str(completion)
+            text = _extract_completion_text(completion)
 
             think_count = len(re.findall(r'<think>', text, re.IGNORECASE))
             think_close = len(re.findall(r'</think>', text, re.IGNORECASE))
@@ -1579,57 +1680,73 @@ def main(config: Optional[ChessGRPOConfig] = None):
     # ========================================================================
     logger.info("Configuring GRPO trainer...")
     
-    training_args = GRPOConfig(
+    training_args_kwargs = {
         # Output
-        output_dir=config.output_dir,
-        run_name="chess-grpo-h100",
-        
-        # Batch settings
-        per_device_train_batch_size=config.per_device_train_batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        
-        # GRPO specific
-        num_generations=config.num_generations,
-        max_prompt_length=config.max_prompt_length,
-        max_completion_length=config.max_completion_length,
-        temperature=config.temperature,
-        beta=config.beta,
-        # 2025 best practices: batch-level reward scaling and mask truncated outputs
-        scale_rewards=config.scale_rewards,
-        mask_truncated_completions=config.mask_truncated_completions,
+        "output_dir": config.output_dir,
+        "run_name": "chess-grpo-h100",
 
-        # DAPO loss configuration (2025 best practice for reasoning tasks)
-        loss_type=config.loss_type,
-        epsilon=config.epsilon,
-        epsilon_high=config.epsilon_high,
+        # Batch settings
+        "per_device_train_batch_size": config.per_device_train_batch_size,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+
+        # GRPO specific
+        "num_generations": config.num_generations,
+        "max_prompt_length": config.max_prompt_length,
+        "max_completion_length": config.max_completion_length,
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "top_k": config.top_k,
+        "min_p": config.min_p,
+        "beta": config.beta,
+        # 2025 best practices: batch-level reward scaling and mask truncated outputs
+        "scale_rewards": config.scale_rewards,
+        "mask_truncated_completions": config.mask_truncated_completions,
+
+        # DAPO / Dr. GRPO loss configuration
+        "loss_type": config.loss_type,
+        "epsilon": config.epsilon,
+        "epsilon_high": config.epsilon_high,
 
         # vLLM integration (Unsloth handles this)
-        use_vllm=config.use_vllm,
-        
+        "use_vllm": config.use_vllm,
+
         # Optimizer
-        learning_rate=config.learning_rate,
-        weight_decay=config.weight_decay,
-        warmup_ratio=config.warmup_ratio,
-        lr_scheduler_type=config.lr_scheduler_type,
-        optim=config.optim,
-        
+        "learning_rate": config.learning_rate,
+        "weight_decay": config.weight_decay,
+        "warmup_ratio": config.warmup_ratio,
+        "lr_scheduler_type": config.lr_scheduler_type,
+        "optim": config.optim,
+
         # Training duration
-        num_train_epochs=config.num_train_epochs,
-        max_steps=config.max_steps,
-        
+        "num_train_epochs": config.num_train_epochs,
+        "max_steps": config.max_steps,
+
         # Precision
-        bf16=is_bfloat16_supported(),
-        fp16=not is_bfloat16_supported(),
-        
+        "bf16": is_bfloat16_supported(),
+        "fp16": not is_bfloat16_supported(),
+
         # Logging
-        logging_steps=config.logging_steps,
-        save_steps=config.save_steps,
-        max_grad_norm=config.max_grad_norm,
-        
+        "logging_steps": config.logging_steps,
+        "save_steps": config.save_steps,
+        "max_grad_norm": config.max_grad_norm,
+
         # Misc
-        remove_unused_columns=False,
-        report_to=["wandb", "tensorboard"] if config.use_wandb else ["tensorboard"],
-    )
+        "remove_unused_columns": False,
+        "report_to": ["wandb", "tensorboard"] if config.use_wandb else ["tensorboard"],
+    }
+
+    try:
+        training_args = GRPOConfig(**training_args_kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        import inspect
+
+        allowed = set(inspect.signature(GRPOConfig.__init__).parameters)
+        filtered = {k: v for k, v in training_args_kwargs.items() if k in allowed}
+        dropped = sorted(set(training_args_kwargs) - set(filtered))
+        logger.warning(f"GRPOConfig does not support {dropped}; ignoring.")
+        training_args = GRPOConfig(**filtered)
 
     # ========================================================================
     # Initialize Wandb
@@ -1648,7 +1765,11 @@ def main(config: Optional[ChessGRPOConfig] = None):
                 "num_generations": config.num_generations,
                 "max_completion_length": config.max_completion_length,
                 "temperature": config.temperature,
+                "top_p": config.top_p,
+                "top_k": config.top_k,
+                "min_p": config.min_p,
                 "beta": config.beta,
+                "scale_rewards": config.scale_rewards,
                 "loss_type": config.loss_type,
                 "epsilon": config.epsilon,
                 "epsilon_high": config.epsilon_high,
