@@ -18,6 +18,7 @@ Key optimizations:
 
 import os
 import re
+import math
 import random
 import logging
 import shutil
@@ -165,7 +166,22 @@ class ChessGRPOConfig:
     # Output
     output_dir: str = "./chess_grpo_h100_output"
     
-    # Reward weights (rebalanced to emphasize move quality)
+    # Reward type: "wpd" (Win Probability Delta) or "topn" (legacy ranking)
+    reward_type: str = "wpd"
+
+    # WPD reward settings (used when reward_type="wpd")
+    wdl_model: str = "sf"  # WDL model: "sf" (latest), "sf16", "lichess"
+    base_reward: float = 1.0
+    wpd_penalty_scale: float = 4.0  # Higher = stricter penalty for suboptimal moves
+    excellent_threshold: float = 0.02  # wpd < 2% = essentially best move
+    excellent_bonus: float = 0.5
+    good_threshold: float = 0.05  # wpd < 5% = strong move
+    good_bonus: float = 0.2
+    min_reward: float = -1.0  # Floor for negative rewards
+    default_ply: int = 30  # Default ply for WDL model
+    estimate_ply_from_fen: bool = True  # Estimate ply from FEN fullmove number
+
+    # Top-N reward weights (used when reward_type="topn")
     reward_top1: float = 1.5
     reward_top3: float = 1.0
     reward_top5: float = 0.6
@@ -248,6 +264,31 @@ class ChessGRPOConfig:
             config.stockfish_hash_mb = as_int(stockfish["hash_mb"], config.stockfish_hash_mb)
 
         reward = section("reward")
+        # Reward type selection
+        if "reward_type" in reward:
+            config.reward_type = str(reward["reward_type"])
+        # WPD settings
+        if "wdl_model" in reward:
+            config.wdl_model = str(reward["wdl_model"])
+        if "base_reward" in reward:
+            config.base_reward = as_float(reward["base_reward"], config.base_reward)
+        if "wpd_penalty_scale" in reward:
+            config.wpd_penalty_scale = as_float(reward["wpd_penalty_scale"], config.wpd_penalty_scale)
+        if "excellent_threshold" in reward:
+            config.excellent_threshold = as_float(reward["excellent_threshold"], config.excellent_threshold)
+        if "excellent_bonus" in reward:
+            config.excellent_bonus = as_float(reward["excellent_bonus"], config.excellent_bonus)
+        if "good_threshold" in reward:
+            config.good_threshold = as_float(reward["good_threshold"], config.good_threshold)
+        if "good_bonus" in reward:
+            config.good_bonus = as_float(reward["good_bonus"], config.good_bonus)
+        if "min_reward" in reward:
+            config.min_reward = as_float(reward["min_reward"], config.min_reward)
+        if "default_ply" in reward:
+            config.default_ply = as_int(reward["default_ply"], config.default_ply)
+        if "estimate_ply_from_fen" in reward:
+            config.estimate_ply_from_fen = as_bool(reward["estimate_ply_from_fen"], config.estimate_ply_from_fen)
+        # Top-N settings (legacy)
         if "top1_reward" in reward:
             config.reward_top1 = as_float(reward["top1_reward"], config.reward_top1)
         if "top3_reward" in reward:
@@ -843,42 +884,445 @@ class StockfishRewardEngine:
             self.engine.quit()
 
 
+# ============================================================================
+# Win Probability Delta (WPD) Reward Engine
+# ============================================================================
+
+class WinProbabilityRewardEngine:
+    """
+    Reward engine using Win Probability Delta instead of top-N matching.
+
+    Core idea:
+    - Get Stockfish's evaluation of the position BEFORE the move
+    - Get Stockfish's evaluation of the position AFTER the model's move
+    - Convert both to win probability using the WDL model
+    - Reward = f(probability_loss)
+
+    This naturally handles:
+    - Position complexity: Tactical positions have steeper probability gradients
+    - Game phase: WDL model accounts for ply/material
+    - Non-linearity: Same CP loss means different things at different eval ranges
+
+    Optimizations:
+    - MultiPV caching: Request top 5 moves upfront; if predicted move is in top 5,
+      use cached score instead of re-analyzing (avoids 2nd Stockfish call)
+    - Post-move cache: Cache (fen, move) -> expectation for repeated predictions
+    """
+
+    MAX_RETRIES = 3
+    MULTIPV_SIZE = 5  # Request top 5 moves to check if predicted is among them
+
+    def __init__(self, config: ChessGRPOConfig):
+        self.config = config
+        self.engine = None
+        self._init_engine()
+
+        # Stats tracking
+        self.stats = {
+            "total": 0,
+            "legal": 0,
+            "illegal": 0,
+            "no_move": 0,
+            "excellent": 0,  # wpd < 0.02
+            "good": 0,       # wpd < 0.05
+            "acceptable": 0, # wpd < 0.10
+            "inaccuracy": 0, # wpd < 0.20
+            "mistake": 0,    # wpd < 0.35
+            "blunder": 0,    # wpd >= 0.35
+            "engine_restarts": 0,
+            "avg_wpd": 0.0,
+            "total_wpd": 0.0,
+            "wpd_samples": 0,
+            "cache_hits": 0,      # Position cache hits
+            "multipv_hits": 0,    # Predicted move found in cached top-N (avoids 2nd analysis)
+            "postmove_hits": 0,   # Post-move cache hits
+        }
+
+        # Cache: FEN -> (best_move, best_expectation, move_expectations_dict)
+        # move_expectations_dict maps move_uci -> expectation for top N moves
+        self._cache: Dict[str, tuple] = {}
+        self._cache_maxsize = 10000
+
+        # Post-move cache: (fen, move) -> expectation
+        # For moves not in top-N that we had to analyze
+        self._postmove_cache: Dict[tuple, float] = {}
+        self._postmove_cache_maxsize = 5000
+
+    def _init_engine(self):
+        """Initialize Stockfish engine with UCI_ShowWDL enabled."""
+        if self.engine is not None:
+            try:
+                self.engine.quit()
+            except Exception:
+                pass
+            self.engine = None
+
+        try:
+            self.engine = chess.engine.SimpleEngine.popen_uci(
+                self.config.stockfish_path
+            )
+            self.engine.configure({
+                "Threads": self.config.stockfish_threads,
+                "Hash": self.config.stockfish_hash_mb,
+                "UCI_ShowWDL": True,  # Enable WDL output
+            })
+            logger.info(f"WPD Stockfish initialized: depth={self.config.stockfish_depth}")
+        except Exception as e:
+            logger.error(f"Failed to initialize Stockfish for WPD: {e}")
+            raise
+
+    def _ensure_engine_alive(self) -> bool:
+        """Check if engine is alive, restart if needed."""
+        if self.engine is None:
+            self._init_engine()
+            self.stats["engine_restarts"] += 1
+            return True
+
+        try:
+            self.engine.ping()
+            return True
+        except Exception:
+            self._init_engine()
+            self.stats["engine_restarts"] += 1
+            return True
+
+    def _estimate_ply(self, fen: str) -> int:
+        """Estimate ply from FEN's fullmove number."""
+        if not self.config.estimate_ply_from_fen:
+            return self.config.default_ply
+
+        try:
+            parts = fen.split()
+            if len(parts) >= 6:
+                fullmove = int(parts[5])
+                side_to_move = parts[1]
+                ply = 2 * (fullmove - 1)
+                if side_to_move == 'b':
+                    ply += 1
+                return max(1, min(ply, 200))
+        except (ValueError, IndexError):
+            pass
+        return self.config.default_ply
+
+    def _score_to_expectation(self, score: chess.engine.Score, ply: int) -> float:
+        """
+        Convert a chess.engine.Score to expectation value using WDL model.
+
+        Returns:
+            Expectation value in [0, 1] where:
+            - 1.0 = guaranteed win
+            - 0.5 = draw
+            - 0.0 = guaranteed loss
+        """
+        try:
+            wdl = score.wdl(model=self.config.wdl_model, ply=ply)
+            return wdl.expectation()
+        except Exception:
+            # Fallback: use simple sigmoid approximation if WDL fails
+            cp = score.score(mate_score=10000)
+            if cp is None:
+                return 0.5
+            return 1.0 / (1.0 + math.exp(-cp / 300.0))
+
+    def get_position_expectation(self, fen: str) -> tuple:
+        """
+        Get the best move and its expectation value for a position.
+
+        Uses MultiPV to get top N moves in one analysis call. This allows us to
+        check if the predicted move is in the top N without a second analysis.
+
+        Returns:
+            (best_move_uci, best_expectation, move_expectations_dict) or (None, 0.5, {}) on failure
+        """
+        # Check cache - now returns 3 values
+        if fen in self._cache:
+            self.stats["cache_hits"] += 1
+            return self._cache[fen]
+
+        ply = self._estimate_ply(fen)
+
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                self._ensure_engine_alive()
+                board = chess.Board(fen)
+
+                # Request MultiPV to get top N moves in one call
+                result = self.engine.analyse(
+                    board,
+                    chess.engine.Limit(depth=self.config.stockfish_depth),
+                    multipv=self.MULTIPV_SIZE
+                )
+
+                # Handle both single dict and list of dicts
+                if isinstance(result, dict):
+                    result = [result]
+
+                if not result or "pv" not in result[0] or not result[0]["pv"]:
+                    return None, 0.5, {}
+
+                # Extract best move
+                best_move = result[0]["pv"][0].uci()
+                best_score = result[0]["score"].relative
+                best_expectation = self._score_to_expectation(best_score, ply)
+
+                # Build move -> expectation dict for all top N moves
+                move_expectations = {}
+                for pv_info in result:
+                    if "pv" in pv_info and pv_info["pv"] and "score" in pv_info:
+                        move_uci = pv_info["pv"][0].uci()
+                        score = pv_info["score"].relative
+                        move_expectations[move_uci] = self._score_to_expectation(score, ply)
+
+                # Cache result with all move expectations
+                if len(self._cache) >= self._cache_maxsize:
+                    oldest = next(iter(self._cache))
+                    del self._cache[oldest]
+                self._cache[fen] = (best_move, best_expectation, move_expectations)
+
+                return best_move, best_expectation, move_expectations
+
+            except chess.engine.EngineTerminatedError:
+                self.engine = None
+            except Exception as e:
+                if attempt == self.MAX_RETRIES - 1:
+                    logger.warning(f"[WPD] Analysis failed for {fen}: {e}")
+
+        return None, 0.5, {}
+
+    def get_move_expectation(self, fen: str, move_uci: str) -> Optional[float]:
+        """
+        Get the expectation value AFTER playing a move.
+
+        We need to evaluate the position after the move from the opponent's
+        perspective, then negate to get our expectation.
+
+        This is only called for moves NOT in the top-N (which are already cached).
+        Results are cached in _postmove_cache to avoid re-analysis.
+        """
+        # Check post-move cache first
+        cache_key = (fen, move_uci)
+        if cache_key in self._postmove_cache:
+            self.stats["postmove_hits"] += 1
+            return self._postmove_cache[cache_key]
+
+        ply = self._estimate_ply(fen)
+
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                self._ensure_engine_alive()
+                board = chess.Board(fen)
+                move = chess.Move.from_uci(move_uci)
+
+                if move not in board.legal_moves:
+                    return None
+
+                # Make the move
+                board.push(move)
+
+                # Analyze from opponent's perspective
+                result = self.engine.analyse(
+                    board,
+                    chess.engine.Limit(depth=self.config.stockfish_depth),
+                    multipv=1
+                )
+
+                if "score" not in result:
+                    return 0.5
+
+                # Score is from opponent's perspective
+                opp_score = result["score"].relative
+                opp_expectation = self._score_to_expectation(opp_score, ply + 1)
+
+                # Our expectation = 1 - opponent's expectation
+                our_expectation = 1.0 - opp_expectation
+
+                # Cache the result
+                if len(self._postmove_cache) >= self._postmove_cache_maxsize:
+                    oldest = next(iter(self._postmove_cache))
+                    del self._postmove_cache[oldest]
+                self._postmove_cache[cache_key] = our_expectation
+
+                return our_expectation
+
+            except chess.engine.EngineTerminatedError:
+                self.engine = None
+            except Exception:
+                pass
+
+        return None
+
+    def compute_single_reward(self, fen: str, predicted_move: Optional[str]) -> float:
+        """
+        Compute reward based on Win Probability Delta.
+
+        Reward formula:
+            reward = base_reward - (wpd * wpd_penalty_scale) + bonuses
+
+        Where:
+            wpd = E_best - E_predicted (win probability delta)
+
+        Optimization: If predicted move is in top-N from MultiPV analysis,
+        we use the cached expectation instead of doing a second Stockfish call.
+        """
+        self.stats["total"] += 1
+
+        # No move extracted
+        if predicted_move is None:
+            self.stats["no_move"] += 1
+            return self.config.reward_no_move
+
+        # Check legality
+        try:
+            board = chess.Board(fen)
+            move = chess.Move.from_uci(predicted_move)
+            if move not in board.legal_moves:
+                self.stats["illegal"] += 1
+                return self.config.reward_illegal
+        except (ValueError, chess.IllegalMoveError, chess.InvalidMoveError):
+            self.stats["illegal"] += 1
+            return self.config.reward_illegal
+
+        self.stats["legal"] += 1
+
+        # Get best move and all top-N move expectations from MultiPV analysis
+        best_move, best_expectation, move_expectations = self.get_position_expectation(fen)
+
+        # Check if prediction matches best move
+        if predicted_move == best_move:
+            wpd = 0.0
+        elif predicted_move in move_expectations:
+            # OPTIMIZATION: Predicted move is in top-N, use cached expectation
+            # This avoids a second Stockfish analysis!
+            self.stats["multipv_hits"] += 1
+            pred_expectation = move_expectations[predicted_move]
+            wpd = best_expectation - pred_expectation
+            wpd = max(0.0, min(1.0, wpd))
+        else:
+            # Move is not in top-N, need to analyze the resulting position
+            pred_expectation = self.get_move_expectation(fen, predicted_move)
+            if pred_expectation is None:
+                return self.config.base_reward * 0.3
+
+            # Win Probability Delta
+            wpd = best_expectation - pred_expectation
+            wpd = max(0.0, min(1.0, wpd))
+
+        # Update stats
+        self.stats["total_wpd"] += wpd
+        self.stats["wpd_samples"] += 1
+        self.stats["avg_wpd"] = self.stats["total_wpd"] / self.stats["wpd_samples"]
+
+        # Categorize the move
+        if wpd < self.config.excellent_threshold:
+            self.stats["excellent"] += 1
+        elif wpd < self.config.good_threshold:
+            self.stats["good"] += 1
+        elif wpd < 0.10:
+            self.stats["acceptable"] += 1
+        elif wpd < 0.20:
+            self.stats["inaccuracy"] += 1
+        elif wpd < 0.35:
+            self.stats["mistake"] += 1
+        else:
+            self.stats["blunder"] += 1
+
+        # Compute reward
+        reward = self.config.base_reward - (wpd * self.config.wpd_penalty_scale)
+
+        # Add bonuses for excellent/good moves
+        if wpd < self.config.excellent_threshold:
+            reward += self.config.excellent_bonus
+        elif wpd < self.config.good_threshold:
+            reward += self.config.good_bonus
+
+        # Clamp to minimum
+        reward = max(self.config.min_reward, reward)
+
+        return reward
+
+    def log_stats(self):
+        """Log accumulated statistics."""
+        total = self.stats["total"]
+        legal = self.stats["legal"]
+        if total > 0:
+            # Calculate cache efficiency
+            multipv_rate = self.stats["multipv_hits"] / max(legal, 1)
+            cache_rate = self.stats["cache_hits"] / max(total, 1)
+            postmove_rate = self.stats["postmove_hits"] / max(legal - self.stats["multipv_hits"], 1)
+
+            logger.info(
+                f"[WPD Rewards] Total: {total}, "
+                f"Legal: {legal/total:.1%}, "
+                f"Excellent(<2%): {self.stats['excellent']/max(legal,1):.1%}, "
+                f"Good(<5%): {self.stats['good']/max(legal,1):.1%}, "
+                f"Acceptable(<10%): {self.stats['acceptable']/max(legal,1):.1%}, "
+                f"Inaccuracy(<20%): {self.stats['inaccuracy']/max(legal,1):.1%}, "
+                f"Mistake(<35%): {self.stats['mistake']/max(legal,1):.1%}, "
+                f"Blunder(≥35%): {self.stats['blunder']/max(legal,1):.1%}, "
+                f"Avg WPD: {self.stats['avg_wpd']:.3f}"
+            )
+            logger.info(
+                f"[WPD Cache] Position hits: {cache_rate:.1%}, "
+                f"MultiPV hits: {multipv_rate:.1%} (avoided 2nd analysis), "
+                f"PostMove hits: {postmove_rate:.1%}, "
+                f"Restarts: {self.stats['engine_restarts']}"
+            )
+
+    def close(self):
+        """Cleanup engine."""
+        if self.engine:
+            try:
+                self.engine.quit()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# Reward Function Factory
+# ============================================================================
+
 def create_reward_functions(config: ChessGRPOConfig):
     """
     Create reward functions for GRPO.
-    
+
     Returns multiple reward functions that are summed by GRPOTrainer.
+    Dispatches to WPD or Top-N based on config.reward_type.
     """
-    stockfish = StockfishRewardEngine(config)
-    
+    # Choose reward engine based on config
+    if config.reward_type == "wpd":
+        engine = WinProbabilityRewardEngine(config)
+        reward_name = "WPD"
+    else:
+        engine = StockfishRewardEngine(config)
+        reward_name = "Top-N"
+
+    logger.info(f"Using {reward_name} reward function (reward_type={config.reward_type})")
+
     def _extract_prompt_text(prompt) -> str:
         """Extract text content from prompt (handles both string and chat format)."""
         if isinstance(prompt, list):
-            # Chat format: list of message dicts
-            # Find the user message which contains the FEN
             for msg in prompt:
                 if isinstance(msg, dict) and msg.get("role") == "user":
                     return msg.get("content", "")
-            # Fallback: concatenate all content
             return " ".join(msg.get("content", "") for msg in prompt if isinstance(msg, dict))
         return str(prompt)
 
     # Debug counter for logging samples
     _debug_counter = {"count": 0}
 
-    # Main Stockfish reward function
-    def stockfish_reward_func(completions, prompts, **kwargs):
+    # Main move quality reward function (WPD or Top-N based on engine)
+    def move_quality_reward_func(completions, prompts, **kwargs):
         """
-        Stockfish-based move quality reward.
+        Move quality reward using configured engine (WPD or Top-N).
 
         Args:
-            completions: List of model completions (string or chat format)
-            prompts: List of prompts (string or chat format, contains FEN)
+            completions: List of model completions
+            prompts: List of prompts (contains FEN)
 
         Returns:
             List of float rewards
         """
-        # Pre-extract all unique FENs and warm the cache
+        # Pre-extract unique FENs for cache warming
         unique_fens = set()
         for prompt in prompts:
             prompt_text = _extract_prompt_text(prompt)
@@ -886,39 +1330,37 @@ def create_reward_functions(config: ChessGRPOConfig):
             if fen_match:
                 unique_fens.add(fen_match.group(1).strip())
 
-        # Pre-analyze unique FENs (warms cache, avoids redundant analysis)
+        # Pre-analyze unique FENs (warms cache)
         if unique_fens and _debug_counter["count"] <= 10:
-            print(f"[stockfish] Pre-analyzing {len(unique_fens)} unique positions for {len(completions)} completions", flush=True)
+            print(f"[{reward_name}] Pre-analyzing {len(unique_fens)} unique positions for {len(completions)} completions", flush=True)
         for fen in unique_fens:
-            stockfish.get_top_moves(fen)  # This caches the result
+            if config.reward_type == "wpd":
+                engine.get_position_expectation(fen)
+            else:
+                engine.get_top_moves(fen)
 
         rewards = []
         for completion, prompt in zip(completions, prompts):
-            # Handle completion format (could be string or list of dicts)
             if isinstance(completion, list):
                 text = completion[0].get("content", "") if completion else ""
             else:
                 text = str(completion)
 
-            # Debug: print first few completions to see what model is generating
             _debug_counter["count"] += 1
             if _debug_counter["count"] <= 5:
                 print(f"\n{'='*60}", flush=True)
-                print(f"[REWARD DEBUG {_debug_counter['count']}/5]", flush=True)
-                print(f"Completion type: {type(completion)}", flush=True)
+                print(f"[{reward_name} REWARD DEBUG {_debug_counter['count']}/5]", flush=True)
                 print(f"Completion ({len(text)} chars):", flush=True)
                 print(text[:800], flush=True)
                 if len(text) > 800:
                     print(f"... [truncated] ...", flush=True)
                     print(text[-200:], flush=True)
 
-            # Extract FEN from prompt (handles both string and chat format)
             prompt_text = _extract_prompt_text(prompt)
             fen_match = re.search(r'FEN:\s*([^\n]+)', prompt_text)
             if not fen_match:
                 if _debug_counter["count"] <= 5:
-                    print(f"[REWARD DEBUG] No FEN found in prompt!", flush=True)
-                    print(f"Prompt: {prompt_text[:300]}...", flush=True)
+                    print(f"[{reward_name}] No FEN found in prompt!", flush=True)
                 rewards.append(config.reward_no_move)
                 continue
 
@@ -928,9 +1370,8 @@ def create_reward_functions(config: ChessGRPOConfig):
             if _debug_counter["count"] <= 5:
                 print(f"FEN: {fen}", flush=True)
                 print(f"Extracted move: {predicted_move}", flush=True)
-                print(f"Computing Stockfish reward...", flush=True)
 
-            reward = stockfish.compute_single_reward(fen, predicted_move)
+            reward = engine.compute_single_reward(fen, predicted_move)
 
             if _debug_counter["count"] <= 5:
                 print(f"Reward: {reward}", flush=True)
@@ -939,29 +1380,26 @@ def create_reward_functions(config: ChessGRPOConfig):
             rewards.append(reward)
 
         if _debug_counter["count"] <= 10:
-            print(f"[stockfish_reward_func] Completed {len(rewards)} rewards", flush=True)
+            print(f"[{reward_name}] Completed {len(rewards)} rewards", flush=True)
         return rewards
 
     # Format reward - encourages proper <think>...</think><uci_move>...</uci_move> format
     def format_reward_func(completions, **kwargs):
         """Reward for proper output format."""
         pattern = r'<think>[\s\S]*?</think>\s*<uci_move>[a-h][1-8][a-h][1-8][qrbn]?</uci_move>'
-        
+
         rewards = []
         for completion in completions:
             if isinstance(completion, list):
                 text = completion[0].get("content", "") if completion else ""
             else:
                 text = str(completion)
-            
-            # Check format
-            if re.search(pattern, text, re.IGNORECASE):
-                rewards.append(config.reward_format_bonus)  # Small bonus for correct format
-            else:
-                rewards.append(config.reward_format_penalty)  # Small penalty for wrong format
 
-        if _debug_counter["count"] <= 10:
-            print(f"[format_reward_func] Completed {len(rewards)} rewards", flush=True)
+            if re.search(pattern, text, re.IGNORECASE):
+                rewards.append(config.reward_format_bonus)
+            else:
+                rewards.append(config.reward_format_penalty)
+
         return rewards
 
     # XML tag count reward - ensures exactly one of each tag
@@ -984,16 +1422,14 @@ def create_reward_functions(config: ChessGRPOConfig):
             else:
                 rewards.append(config.reward_xml_penalty)
 
-        if _debug_counter["count"] <= 10:
-            print(f"[xml_count_reward_func] Completed {len(rewards)} rewards", flush=True)
         return rewards
-    
-    # Attach cleanup
-    stockfish_reward_func.stockfish = stockfish
-    stockfish_reward_func.close = stockfish.close
-    stockfish_reward_func.log_stats = stockfish.log_stats
-    
-    return [stockfish_reward_func, format_reward_func, xml_count_reward_func]
+
+    # Attach cleanup methods
+    move_quality_reward_func.engine = engine
+    move_quality_reward_func.close = engine.close
+    move_quality_reward_func.log_stats = engine.log_stats
+
+    return [move_quality_reward_func, format_reward_func, xml_count_reward_func]
 
 
 # ============================================================================

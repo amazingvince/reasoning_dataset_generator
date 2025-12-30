@@ -129,23 +129,54 @@ training:
 
 ## Reward Function
 
-Stockfish-based reward with format bonuses (rebalanced to emphasize move quality):
+Two reward strategies are available, controlled by `reward_type` in config:
+
+### Win Probability Delta (WPD) - Recommended
+
+Set `reward_type: "wpd"` (default). WPD measures how much win probability a move loses compared to the best move:
+
+| Move Quality | WPD Range | Reward |
+|-------------|-----------|--------|
+| Excellent   | < 0.02    | +1.50  |
+| Good        | < 0.05    | +1.08  |
+| Acceptable  | < 0.10    | +0.68  |
+| Inaccuracy  | < 0.20    | +0.40  |
+| Mistake     | < 0.35    | +0.00  |
+| Blunder     | ≥ 0.35    | -0.60  |
+
+**Why WPD over Top-N?**
+- **Quiet positions**: Moves 1-5 may all be within 5cp → WPD rewards all highly
+- **Tactical positions**: "Top 3" move might lose 200cp → WPD correctly penalizes as blunder
+- Top-N would reward both scenarios the same, despite vastly different quality
+
+**Key WPD config options:**
+```yaml
+reward:
+  reward_type: "wpd"
+  wpd_penalty_scale: 4.0  # Higher = stricter (reward = 1.0 - wpd * scale)
+  excellent_threshold: 0.02
+  excellent_bonus: 0.5
+```
+
+### Legacy Top-N Ranking
+
+Set `reward_type: "topn"` for ranking-based rewards:
 
 ```python
-# Move quality (main reward - increased weights)
 Top 1 match:  +1.5   # Matches Stockfish best move
 Top 3 match:  +1.0   # Strong alternative
 Top 5 match:  +0.6   # Reasonable move
 Legal move:   +0.1   # Legal but not in top 5
 Illegal:      -0.5
 No move:      -1.0
+```
 
-# Format (reduced to avoid masking move quality)
+### Format Rewards (both modes)
+
+```python
 Correct format: +0.1   # <think>...</think><uci_move>...</uci_move>
 Wrong format:   -0.1
 ```
-
-**Why rebalanced?** The original format bonus (+0.3 combined) could mask poor move quality. A model outputting correct format but bad moves would score similarly to one with good moves but formatting issues. The new weights ensure move quality dominates the reward signal.
 
 ## Training Tips
 
@@ -204,10 +235,17 @@ grpo/
 ## Expected Results
 
 After training:
-- **Top-1 accuracy**: 15-25% (matching Stockfish exactly)
-- **Top-5 accuracy**: 50-70% 
 - **Legal move rate**: 95%+
-- **Avg centipawn loss**: <50
+
+### WPD Metrics (when using `reward_type: wpd`)
+- **Avg WPD**: < 0.05 (lower is better)
+- **Excellent rate**: > 30% (moves with wpd < 0.02)
+- **Blunder rate**: < 5% (moves with wpd >= 0.35)
+
+### Top-N Metrics (when using `reward_type: topn`)
+- **Top-1 accuracy**: 15-25% (matching Stockfish exactly)
+- **Top-5 accuracy**: 50-70%
+- **Avg centipawn loss**: < 50
 
 ## References
 

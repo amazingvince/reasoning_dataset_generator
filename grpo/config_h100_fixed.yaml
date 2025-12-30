@@ -48,17 +48,38 @@ stockfish:
   threads: 8
   hash_mb: 512
 
-# Reward Configuration - OPTIONAL: Wider spread for stronger gradients
+# Reward Configuration
 reward:
-  # You can try wider spread, but this is secondary to the grad_norm fix
-  top1_reward: 3.0      # Was 1.5 - slightly increased
-  top3_reward: 1.5      # Was 1.0
-  top5_reward: 0.8      # Was 0.6
-  legal_reward: 0.1     # Keep as-is
-  illegal_penalty: -1.0  # Was -0.5 - slightly stronger
-  no_move_penalty: -2.0  # Was -1.0 - slightly stronger
+  # =================================================================
+  # Reward Type: "wpd" (Win Probability Delta) or "topn" (legacy)
+  # =================================================================
+  # WPD measures how much win probability a move loses vs the best move.
+  # This is more principled than Top-N because:
+  # - In quiet positions: moves 1-5 may all be within 5cp (all good)
+  # - In tactical positions: move 2 might be a blunder (-200cp)
+  # Top-N would reward both "Top 3" equally despite vastly different quality.
+  # =================================================================
+  reward_type: "wpd"
 
-  # Format rewards (keep small - these are working fine)
+  # WPD Settings (used when reward_type: wpd)
+  wdl_model: "sf"            # WDL model: "sf" (latest), "sf16", "lichess"
+  base_reward: 1.0           # Base reward before WPD adjustment
+  wpd_penalty_scale: 4.0     # Higher = stricter (reward = base - wpd * scale)
+  excellent_threshold: 0.02  # wpd < 2% = essentially best move (+bonus)
+  excellent_bonus: 0.5
+  good_threshold: 0.05       # wpd < 5% = strong move (+bonus)
+  good_bonus: 0.2
+  min_reward: -1.0           # Floor for negative rewards
+
+  # Top-N Settings (used when reward_type: topn)
+  top1_reward: 3.0
+  top3_reward: 1.5
+  top5_reward: 0.8
+  legal_reward: 0.1
+  illegal_penalty: -1.0
+  no_move_penalty: -2.0
+
+  # Format rewards (small - shared by both reward types)
   format_bonus: 0.1
   format_penalty: -0.1
   xml_bonus: 0.05
