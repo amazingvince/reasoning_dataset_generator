@@ -1,0 +1,223 @@
+# Chess GRPO Training Configuration - Dr. GRPO Version
+# =====================================================================
+# This config addresses the "advantage collapse" / flat loss problem
+# by using Dr. GRPO (no std normalization) + increased generation diversity.
+#
+# PROBLEM DIAGNOSED:
+# - Loss was oscillating near zero (std=0.005, should be ~0.05)
+# - Continuous WPD rewards + decent SFT model = low variance within groups
+# - Dividing by group std was collapsing advantages to near-zero
+#
+# KEY CHANGES:
+# 1. scale_rewards: false (Dr. GRPO - no std division)
+# 2. loss_type: "dr_grpo" (proper token-level aggregation)
+# 3. temperature: 1.1 (more diverse generations)
+# 4. learning_rate: 5.0e-5 (3x increase to compensate)
+# =====================================================================
+
+# Model Configuration
+model:
+  name_or_path: "amazingvince/chess_qwen3_4b_reasoning_v2"
+  max_seq_length: 4096
+
+# Unsloth Configuration
+unsloth:
+  use_lora: true
+  load_in_4bit: false
+  use_fp8: false
+  use_gradient_checkpointing: true
+  gpu_memory_utilization: 0.85
+  use_fp8_kv_cache: false
+
+# LoRA Configuration
+lora:
+  r: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+# Stockfish Configuration
+stockfish:
+  path: "/usr/games/stockfish"
+  depth: 20
+  threads: 8
+  hash_mb: 512
+
+# Reward Configuration
+reward:
+  reward_type: "wpd"
+  
+  # WPD Settings - INCREASED CONTRAST for better signal
+  wdl_model: "sf"
+  base_reward: 1.0
+  wpd_penalty_scale: 6.0      # Was 4.0 - sharper penalties for suboptimal moves
+  excellent_threshold: 0.02
+  excellent_bonus: 0.8        # Was 0.5 - bigger bonus for best moves
+  good_threshold: 0.05
+  min_reward: -1.5            # Was -1.0 - allow stronger negative signal
+
+  # Format rewards
+  format_bonus: 0.1
+  format_penalty: -0.1
+  xml_bonus: 0.05
+  xml_penalty: -0.15
+
+# Data Configuration
+data:
+  seed: 42
+  games_dataset: "Lichess/standard-chess-games"
+  min_elo: 800
+  sample_rate: 0.3
+  skip_first_moves: 4
+  skip_last_moves: 0
+  
+  puzzles_dataset: "Lichess/chess-puzzles"
+  min_puzzle_rating: 800
+  max_puzzle_rating: 2500
+  puzzle_ratio: 0.3
+  
+  elo_weights:
+    800: 0.08
+    1000: 0.10
+    1200: 0.12
+    1400: 0.15
+    1600: 0.18
+    1800: 0.20
+    2000: 0.18
+    2200: 0.12
+    2400: 0.08
+  
+  num_train_samples: 50000
+
+# GRPO Training Configuration - DR. GRPO
+training:
+  per_device_train_batch_size: 16
+  gradient_accumulation_steps: 2
+  num_generations: 16
+  max_prompt_length: 1024
+  max_completion_length: 2048
+
+  # =====================================================================
+  # FIX 1: GENERATION DIVERSITY - Get different moves, not just tokens
+  # =====================================================================
+  # Higher temperature = more exploration = more reward variance per group
+  # This is critical for continuous rewards where model is already decent
+  # =====================================================================
+  temperature: 1.1            # Was 0.9 - need more diverse moves
+  top_p: 0.95                 # Add nucleus sampling for diversity
+
+  # =====================================================================
+  # FIX 2: DR. GRPO - Remove std normalization that was killing gradients
+  # =====================================================================
+  # "Understanding R1-Zero-Like Training" paper found that dividing by
+  # group std creates difficulty bias AND collapses advantages when
+  # reward variance is low (your exact problem).
+  #
+  # With scale_rewards=false:
+  #   advantage = reward - group_mean  (NO division by std!)
+  #
+  # This means advantages will be larger and more meaningful.
+  # =====================================================================
+  scale_rewards: none         # KEY FIX: Dr. GRPO style, no std normalization
+
+  # =====================================================================
+  # FIX 3: DR. GRPO LOSS TYPE - Proper token-level aggregation
+  # =====================================================================
+  # "dr_grpo" normalizes by a global constant instead of sequence length,
+  # eliminating length bias while preserving gradient magnitude.
+  # =====================================================================
+  loss_type: "dr_grpo"        # Was "dapo" - use full Dr. GRPO
+
+  # Keep DAPO-style clipping (works with dr_grpo loss)
+  epsilon: 0.2
+  epsilon_high: 0.28
+
+  # No KL penalty for verifiable rewards
+  beta: 0.0
+
+  mask_truncated_completions: true
+  max_grad_norm: 1.0
+
+  # =====================================================================
+  # FIX 4: LEARNING RATE - Increase since advantages are no longer normalized
+  # =====================================================================
+  # Without std normalization, advantage magnitudes depend on raw reward scale.
+  # Your rewards range [-1.5, 1.5], so advantages could be ~0.5-1.0 magnitude.
+  # This is fine, but we increase LR to ensure sufficient updates.
+  # =====================================================================
+  learning_rate: 5.0e-5       # Was 1.5e-5 - 3x increase
+
+  weight_decay: 0.1
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+  optim: adamw_torch_fused
+  
+  num_train_epochs: 1
+  max_steps: -1
+  logging_steps: 1
+  save_steps: 500
+  use_vllm: true
+  output_dir: "./chess_grpo_drgrpo_output"
+
+# Weights & Biases Configuration
+wandb:
+  enabled: true
+  project: "chess-grpo"
+  run_name: "chess-grpo-drgrpo-v1"
+  entity: null
+
+# =====================================================================
+# EXPECTED RESULTS
+# =====================================================================
+#
+# BEFORE (your current run):
+#   - Loss std: ~0.005 (way too small)
+#   - Loss range: [-0.01, +0.01]
+#   - 23% of steps with near-zero loss
+#   - Reward not improving
+#
+# AFTER (with this config):
+#   - Loss std: ~0.03-0.08 (10x larger)
+#   - Loss range: [-0.1, +0.1] or wider
+#   - <5% of steps with near-zero loss
+#   - Reward should improve over training
+#
+# WHAT TO MONITOR:
+#   1. Loss magnitude - should be 10x larger
+#   2. reward_std in wandb - should see variance
+#   3. Reward mean over time - should trend upward
+#   4. If loss explodes: reduce learning_rate to 3.0e-5
+#
+# IF STILL FLAT after ~200 steps:
+#   - Problem is generation diversity (all 16 outputs same move)
+#   - Try temperature: 1.3 or num_generations: 24
+#   - Or make rewards more discrete (see alternate reward config below)
+#
+# =====================================================================
+
+# =====================================================================
+# ALTERNATE: More Aggressive Reward Shaping (uncomment if needed)
+# =====================================================================
+# If Dr. GRPO alone doesn't fix it, the issue is reward variance.
+# This config makes rewards more "binary-like" for clearer signal:
+#
+# reward:
+#   reward_type: "wpd"
+#   wdl_model: "sf"
+#   base_reward: 1.0
+#   wpd_penalty_scale: 10.0    # Very harsh penalties
+#   excellent_threshold: 0.02
+#   excellent_bonus: 1.5       # Big bonus for top moves
+#   good_threshold: 0.03       # Narrower "good" window
+#   min_reward: -2.0           # Strong negative signal
+#
+# This creates more separation: excellent moves get ~+2.5, 
+# mediocre moves get ~-0.5, bad moves get ~-2.0
+# =====================================================================
