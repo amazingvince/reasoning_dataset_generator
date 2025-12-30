@@ -85,8 +85,9 @@ reward:
   xml_bonus: 0.05
   xml_penalty: -0.15
 
-# Data Configuration  
+# Data Configuration
 data:
+  seed: 42  # Change to get different positions when resuming from checkpoint
   games_dataset: "Lichess/standard-chess-games"
   min_elo: 800
   sample_rate: 0.3

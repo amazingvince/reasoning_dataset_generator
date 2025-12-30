@@ -89,6 +89,7 @@ class ChessGRPOConfig:
     stockfish_hash_mb: int = 512
     
     # Data settings
+    seed: int = 42  # Random seed for dataset sampling (change to get different positions)
     games_dataset: str = "Lichess/standard-chess-games"
     puzzles_dataset: str = "Lichess/chess-puzzles"
     min_elo: int = 800
@@ -311,6 +312,8 @@ class ChessGRPOConfig:
             config.reward_xml_penalty = as_float(reward["xml_penalty"], config.reward_xml_penalty)
 
         data_cfg = section("data")
+        if "seed" in data_cfg:
+            config.seed = as_int(data_cfg["seed"], config.seed)
         if "games_dataset" in data_cfg:
             config.games_dataset = str(data_cfg["games_dataset"])
         if "puzzles_dataset" in data_cfg:
@@ -1556,11 +1559,11 @@ def main(config: Optional[ChessGRPOConfig] = None):
     # ========================================================================
     # Create Dataset
     # ========================================================================
-    logger.info("Creating training dataset...")
-    dataset = create_dataset(config, seed=42)
+    logger.info(f"Creating training dataset with seed={config.seed}...")
+    dataset = create_dataset(config, seed=config.seed)
     
     # Split
-    split = dataset.train_test_split(test_size=0.05, seed=42)
+    split = dataset.train_test_split(test_size=0.05, seed=config.seed)
     train_dataset = split["train"]
     eval_dataset = split["test"]
     
