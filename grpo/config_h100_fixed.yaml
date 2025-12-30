@@ -1,0 +1,203 @@
+# Chess GRPO Training Configuration - FIXED for Flat Loss Issue
+# =================================================================
+# This config addresses the "loss oscillating around zero" problem.
+#
+# KEY CHANGES from original (respecting 2025 research):
+# 1. max_grad_norm: 1.0 (was 0.1 - way too aggressive!)
+# 2. learning_rate: 1.5e-5 (was 5e-6 - too conservative for LoRA)
+# 3. Optionally wider reward spread for stronger signal
+#
+# KEEPING research-backed settings:
+# - scale_rewards: "batch" (R1-Zero-Like Training paper)
+# - epsilon: 0.2, epsilon_high: 0.28 (DAPO paper exact values)
+# - beta: 0.0 (multiple papers on verifiable rewards)
+# =================================================================
+
+# Model Configuration
+model:
+  name_or_path: "amazingvince/chess_qwen3_4b_reasoning_v2"  # Your SFT model
+  max_seq_length: 4096
+
+# Unsloth Configuration
+unsloth:
+  use_lora: true
+  load_in_4bit: false
+  use_fp8: false
+  use_gradient_checkpointing: true
+  gpu_memory_utilization: 0.85
+  use_fp8_kv_cache: false
+
+# LoRA Configuration
+lora:
+  r: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+# Stockfish Configuration
+stockfish:
+  path: "/usr/games/stockfish"
+  depth: 20
+  threads: 8
+  hash_mb: 512
+
+# Reward Configuration - OPTIONAL: Wider spread for stronger gradients
+reward:
+  # You can try wider spread, but this is secondary to the grad_norm fix
+  top1_reward: 3.0      # Was 1.5 - slightly increased
+  top3_reward: 1.5      # Was 1.0
+  top5_reward: 0.8      # Was 0.6
+  legal_reward: 0.1     # Keep as-is
+  illegal_penalty: -1.0  # Was -0.5 - slightly stronger
+  no_move_penalty: -2.0  # Was -1.0 - slightly stronger
+
+  # Format rewards (keep small - these are working fine)
+  format_bonus: 0.1
+  format_penalty: -0.1
+  xml_bonus: 0.05
+  xml_penalty: -0.15
+
+# Data Configuration  
+data:
+  games_dataset: "Lichess/standard-chess-games"
+  min_elo: 800
+  sample_rate: 0.3
+  skip_first_moves: 4
+  skip_last_moves: 2
+  
+  puzzles_dataset: "Lichess/chess-puzzles"
+  min_puzzle_rating: 800
+  max_puzzle_rating: 2500
+  puzzle_ratio: 0.3
+  
+  elo_weights:
+    800: 0.08
+    1000: 0.10
+    1200: 0.12
+    1400: 0.15
+    1600: 0.18
+    1800: 0.20
+    2000: 0.18
+    2200: 0.12
+    2400: 0.08
+  
+  num_train_samples: 50000
+
+# GRPO Training Configuration - FIXED
+training:
+  per_device_train_batch_size: 1
+  # Note: With 16 generations, may need to reduce grad_accum if OOM
+  gradient_accumulation_steps: 4
+  # =================================================================
+  # FIX 3: Increase group size (num_generations)
+  # =================================================================
+  # DAPO paper uses 16 responses per prompt
+  # Comparative analysis paper: "Increasing group size leads to
+  # more stable training dynamics and higher accuracy"
+  # =================================================================
+  num_generations: 16    # Was: 8 (DAPO paper uses 16)
+  max_prompt_length: 1024
+  max_completion_length: 2048
+  temperature: 0.7
+
+  # =================================================================
+  # KEEP: Research-backed reward scaling
+  # =================================================================
+  # "batch" is recommended by Understanding R1-Zero-Like Training paper
+  # "group" can cause difficulty bias (easy puzzles weighted same as hard)
+  # =================================================================
+  scale_rewards: "batch"  # KEEP as per research
+
+  # =================================================================
+  # KEEP: DAPO loss with paper-specified values
+  # =================================================================
+  # These exact values (0.2/0.28) achieved 50% on AIME 2024
+  # Don't change unless you have good reason
+  # =================================================================
+  loss_type: "dapo"
+  epsilon: 0.2          # KEEP: DAPO paper value
+  epsilon_high: 0.28    # KEEP: DAPO paper value
+
+  # =================================================================
+  # KEEP: No KL penalty for verifiable rewards
+  # =================================================================
+  # Multiple 2025 papers confirm beta=0 is correct when you have
+  # ground-truth verification (Stockfish) instead of a reward model
+  # =================================================================
+  beta: 0.0  # KEEP as per research
+
+  mask_truncated_completions: true
+
+  # =================================================================
+  # FIX 1: GRADIENT CLIPPING - THE MAIN CULPRIT
+  # =================================================================
+  # Original: 0.1 (way too aggressive!)
+  # Standard PPO/GRPO values: 0.5 - 1.0
+  # 
+  # With max_grad_norm=0.1, gradients were being clipped to 10% of
+  # their natural magnitude, effectively killing the learning signal.
+  # =================================================================
+  max_grad_norm: 1.0    # Was: 0.1 - THIS IS THE MAIN FIX
+
+  # =================================================================
+  # FIX 2: LEARNING RATE - Too conservative for LoRA
+  # =================================================================
+  # Original: 5e-6 (fine for full fine-tuning, low for LoRA)
+  # Typical LoRA range: 1e-5 to 5e-5
+  # =================================================================
+  learning_rate: 1.5e-5  # Was: 5e-6
+
+  weight_decay: 0.1
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+  optim: adamw_torch_fused
+  
+  num_train_epochs: 1
+  max_steps: -1
+  logging_steps: 1
+  save_steps: 500
+  use_vllm: true
+  output_dir: "./chess_grpo_h100_output_fixed"
+
+# Weights & Biases Configuration
+wandb:
+  enabled: true
+  project: "chess-grpo"
+  run_name: "chess-grpo-fixed-v2"
+  entity: null
+
+# =================================================================
+# SUMMARY OF CHANGES (Validated Against Research)
+# =================================================================
+# 
+# FIXED (likely causing flat loss):
+#   max_grad_norm: 0.1 → 1.0  (10x increase, was clipping gradients)
+#   learning_rate: 5e-6 → 1.5e-5 (3x increase, more typical for LoRA)
+#   num_generations: 8 → 16 (DAPO paper uses 16; comparative study
+#       shows "increasing group size leads to more stable training")
+#
+# KEPT (research-backed, don't change):
+#   scale_rewards: "batch"     (R1-Zero-Like Training paper)
+#   loss_type: "dapo"          (DAPO paper)
+#   epsilon: 0.2               (DAPO paper exact value)
+#   epsilon_high: 0.28         (DAPO paper exact value)
+#   beta: 0.0                  (multiple papers on verifiable rewards)
+#
+# EXPECTED RESULTS:
+#   - Loss should have larger magnitude ([-0.1, 0.1] not [-0.01, 0.01])
+#   - More stable training (larger group size = lower variance)
+#   - Faster reward improvement
+#
+# IF OOM WITH 16 GENERATIONS:
+#   - Try num_generations: 12
+#   - Or reduce max_completion_length to 1536
+#   - Or enable use_fp8: true for 1.4x less memory
+#
+# =================================================================
