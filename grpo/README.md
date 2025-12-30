@@ -133,29 +133,35 @@ Two reward strategies are available, controlled by `reward_type` in config:
 
 ### Win Probability Delta (WPD) - Recommended
 
-Set `reward_type: "wpd"` (default). WPD measures how much win probability a move loses compared to the best move:
+Set `reward_type: "wpd"` (default). WPD measures how much win probability a move loses compared to the best move.
 
-| Move Quality | WPD Range | Reward |
-|-------------|-----------|--------|
-| Excellent   | < 0.02    | +1.50  |
-| Good        | < 0.05    | +1.08  |
-| Acceptable  | < 0.10    | +0.68  |
-| Inaccuracy  | < 0.20    | +0.40  |
-| Mistake     | < 0.35    | +0.00  |
-| Blunder     | ≥ 0.35    | -0.60  |
+**Reward formula** (smooth curve, no discontinuities for DAPO compatibility):
+```
+reward = base_reward - (wpd * penalty_scale) + smooth_bonus
+smooth_bonus = excellent_bonus * max(0, 1 - wpd / good_threshold)
+```
+
+| WPD | Linear | Smooth Bonus | Total Reward |
+|-----|--------|--------------|--------------|
+| 0.00 | 1.00 | +0.50 | **+1.50** |
+| 0.02 | 0.92 | +0.30 | **+1.22** |
+| 0.05 | 0.80 | +0.00 | **+0.80** |
+| 0.10 | 0.60 | +0.00 | **+0.60** |
+| 0.25 | 0.00 | +0.00 | **+0.00** |
+| 0.50 | -1.00 | +0.00 | **-1.00** |
 
 **Why WPD over Top-N?**
 - **Quiet positions**: Moves 1-5 may all be within 5cp → WPD rewards all highly
 - **Tactical positions**: "Top 3" move might lose 200cp → WPD correctly penalizes as blunder
-- Top-N would reward both scenarios the same, despite vastly different quality
+- **Smooth curve**: No cliff edges that cause instability with DAPO's batch normalization
 
 **Key WPD config options:**
 ```yaml
 reward:
   reward_type: "wpd"
-  wpd_penalty_scale: 4.0  # Higher = stricter (reward = 1.0 - wpd * scale)
-  excellent_threshold: 0.02
-  excellent_bonus: 0.5
+  wpd_penalty_scale: 4.0  # Higher = stricter
+  excellent_bonus: 0.5    # Max bonus at wpd=0, decays to 0 at good_threshold
+  good_threshold: 0.05    # Bonus decay endpoint
 ```
 
 ### Legacy Top-N Ranking

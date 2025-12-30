@@ -174,10 +174,9 @@ class ChessGRPOConfig:
     wdl_model: str = "sf"  # WDL model: "sf" (latest), "sf16", "lichess"
     base_reward: float = 1.0
     wpd_penalty_scale: float = 4.0  # Higher = stricter penalty for suboptimal moves
-    excellent_threshold: float = 0.02  # wpd < 2% = essentially best move
-    excellent_bonus: float = 0.5
-    good_threshold: float = 0.05  # wpd < 5% = strong move
-    good_bonus: float = 0.2
+    excellent_threshold: float = 0.02  # wpd < 2% for stats tracking (excellent moves)
+    excellent_bonus: float = 0.5  # Max bonus at wpd=0, decays to 0 at good_threshold
+    good_threshold: float = 0.05  # Bonus decays to 0 at this WPD (smooth curve, no cliffs)
     min_reward: float = -1.0  # Floor for negative rewards
     default_ply: int = 30  # Default ply for WDL model
     estimate_ply_from_fen: bool = True  # Estimate ply from FEN fullmove number
@@ -281,8 +280,6 @@ class ChessGRPOConfig:
             config.excellent_bonus = as_float(reward["excellent_bonus"], config.excellent_bonus)
         if "good_threshold" in reward:
             config.good_threshold = as_float(reward["good_threshold"], config.good_threshold)
-        if "good_bonus" in reward:
-            config.good_bonus = as_float(reward["good_bonus"], config.good_bonus)
         if "min_reward" in reward:
             config.min_reward = as_float(reward["min_reward"], config.min_reward)
         if "default_ply" in reward:
@@ -1229,14 +1226,16 @@ class WinProbabilityRewardEngine:
         else:
             self.stats["blunder"] += 1
 
-        # Compute reward
+        # Compute reward with smooth bonus decay (no discontinuities for DAPO)
+        # Linear penalty based on WPD
         reward = self.config.base_reward - (wpd * self.config.wpd_penalty_scale)
 
-        # Add bonuses for excellent/good moves
-        if wpd < self.config.excellent_threshold:
-            reward += self.config.excellent_bonus
-        elif wpd < self.config.good_threshold:
-            reward += self.config.good_bonus
+        # Smooth bonus: decays linearly from excellent_bonus at wpd=0 to 0 at wpd=good_threshold
+        # This avoids cliff edges that cause instability with batch-normalized rewards
+        if wpd < self.config.good_threshold:
+            # Linear interpolation: bonus = excellent_bonus * (1 - wpd / good_threshold)
+            bonus_factor = 1.0 - (wpd / self.config.good_threshold)
+            reward += self.config.excellent_bonus * bonus_factor
 
         # Clamp to minimum
         reward = max(self.config.min_reward, reward)

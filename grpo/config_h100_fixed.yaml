@@ -62,13 +62,15 @@ reward:
   reward_type: "wpd"
 
   # WPD Settings (used when reward_type: wpd)
+  # Reward = base - (wpd * scale) + smooth_bonus
+  # Smooth bonus decays linearly from excellent_bonus at wpd=0 to 0 at good_threshold
+  # This avoids cliff edges that cause instability with DAPO's batch normalization
   wdl_model: "sf"            # WDL model: "sf" (latest), "sf16", "lichess"
   base_reward: 1.0           # Base reward before WPD adjustment
   wpd_penalty_scale: 4.0     # Higher = stricter (reward = base - wpd * scale)
-  excellent_threshold: 0.02  # wpd < 2% = essentially best move (+bonus)
-  excellent_bonus: 0.5
-  good_threshold: 0.05       # wpd < 5% = strong move (+bonus)
-  good_bonus: 0.2
+  excellent_threshold: 0.02  # For stats only: wpd < 2% counted as "excellent"
+  excellent_bonus: 0.5       # Max bonus at wpd=0, decays smoothly to 0
+  good_threshold: 0.05       # Bonus reaches 0 at this WPD (smooth decay endpoint)
   min_reward: -1.0           # Floor for negative rewards
 
   # Top-N Settings (used when reward_type: topn)
@@ -114,9 +116,9 @@ data:
 
 # GRPO Training Configuration - FIXED
 training:
-  per_device_train_batch_size: 1
+  per_device_train_batch_size: 2
   # Note: With 16 generations, may need to reduce grad_accum if OOM
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 8
   # =================================================================
   # FIX 3: Increase group size (num_generations)
   # =================================================================
